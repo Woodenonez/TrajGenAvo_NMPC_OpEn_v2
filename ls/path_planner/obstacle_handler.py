@@ -1,0 +1,738 @@
+
+from queue import Full
+import pyclipper
+import shapely
+import numpy as np
+from sympy.utilities.iterables import reshape
+from CGAL.CGAL_Kernel import Point_2
+from CGAL.CGAL_Triangulation_2 import Constrained_Delaunay_triangulation_2
+import scipy
+from time import perf_counter_ns
+from sympy import symbols, solve, lambdify
+from sympy.testing.pytest import ignore_warnings
+
+
+class FaceInfo2(object):
+    def __init__(self):
+        self.nesting_level = -1
+
+    def in_domain(self):
+        return (self.nesting_level % 2) != 1
+
+class ObstacleHandler:
+    def __init__(self, config, plot_config, plot_queues):
+        self.config = config
+        self.plot_config = plot_config
+        self.plot_queues = plot_queues
+
+        self.inflator = pyclipper.PyclipperOffset()
+        self.times = {'set_dynamic':[], 'set_static':[], 'set_unexpected':[], 'get_closest_obs':[], 'obstacle_as_triangle':[], 'obstacle_as_inequality': [], 'obstacle_as_ellipse':[], 'plot':[]}
+
+        # Calculate the algebraic solution to the mvee equations which represent dynamic obstacles
+        self.mvee_solutions = None
+        self.solve_mvee()
+
+        # These are set via setters 
+        self._dyn_original_obs = None
+        self._dyn_padded_obs = None
+        self._static_original_obs = None
+        self._static_padded_obs = None
+        self._unexpected_original_obs = None
+        self._unexpected_padded_obs = None
+        self._boundry_original = None
+        self._boundry_padded = None
+        self._dynamic_obstacles_shapely = None # Will be a list of shapely ellipses
+        self._static_obstacles_shapely = None # Will be a list of shapely polygons
+        self._unexpected_obstacles_shapely = None # Will be a list of shapely polygons
+
+    def pad_obstacle(self, obstacle, inflation):
+        if obstacle == []: return []
+
+        self.inflator.Clear()
+        self.inflator.AddPath(obstacle, pyclipper.JT_MITER, pyclipper.ET_CLOSEDPOLYGON)
+        inflated_obstacle = pyclipper.scale_from_clipper(self.inflator.Execute(inflation))[0]
+        return inflated_obstacle
+    
+    def pad_obstacles(self, obs, dynamic=False, decrease=False, scale_dist=None):
+        """Pads the obstacles with self.config.vehicle_width or scale_dist 
+
+        Args:
+            obs (list of lists): list of lists of vertices describing the obstacles
+            dynamic (bool, optional): If the obstacle is dynamic then obs is actually list of lists of vertices. Treat it accordingly. Defaults to False.
+            decreate (bool, optional): If the padded obstacle should be smaller. For example boundry. Defaults to False.
+
+        Returns:
+            list: Either a list of list of vertices or list of vertices depending on dynamic
+        """
+        if scale_dist is None:
+            scale_dist = self.config.vehicle_width
+
+
+        if decrease:
+            inflation = pyclipper.scale_to_clipper(-scale_dist)
+        else:
+            inflation = pyclipper.scale_to_clipper(scale_dist)
+        
+        if dynamic:
+            inflated_obstacles = []
+            for i, ob in enumerate(obs):
+                tmp_list = []
+                for j, ob_ in enumerate(ob):
+                    obstacle = pyclipper.scale_to_clipper(ob_)
+                    inflated_obstacle = self.pad_obstacle(obstacle, inflation)
+                    inflated_obstacle.reverse() # obstacles are ordered clockwise
+                    tmp_list.append(inflated_obstacle)
+
+                inflated_obstacles.append(tmp_list)
+
+        else:    
+            inflated_obstacles = []        
+            for ob in obs:
+                obstacle = pyclipper.scale_to_clipper(ob)
+                inflated_obstacle = self.pad_obstacle(obstacle, inflation)
+                inflated_obstacle.reverse() # obstacles are ordered clockwise
+                inflated_obstacles.append(inflated_obstacle)
+
+        res = np.array(inflated_obstacles) if len(inflated_obstacles) == 1 else np.array(inflated_obstacles, dtype='object')
+        return res
+
+    def obstacle_as_ellipse(self, obstacle):
+        """Converts obstacles into ellipses with representation:  (x-c).T * A * (x-c) = 1.
+        Returns A and c. Can convert into any dimension but is inteded to be used for 2D.
+        
+        Args:
+            n_steps_ahead (int, optional): How many time steps ahead to be returned. Defaults to self.config.trajectory_length.
+
+        Returns:
+            list of np arrays: [np.array([A11 A12 A21 A22 c1 c2]), np.array([A11 A12 A21 A22 c1 c2])...]
+        """
+        start_time = perf_counter_ns()
+        def mvee(points, tol = 0.001):
+            """
+            Find the minimum volume ellipse.
+            Return A, c where the equation for the ellipse given in "center form" is
+            (x-c).T * A * (x-c) = 1
+
+            Taken from https://stackoverflow.com/questions/14016898/port-matlab-bounding-ellipsoid-code-to-python
+            """
+            points = np.asmatrix(points)
+            N, d = points.shape
+            Q = np.column_stack((points, np.ones(N))).T
+            err = tol+1.0
+            u = np.ones(N)/N
+            while err > tol:
+                # assert u.sum() == 1 # invariant
+                X = Q * np.diag(u) * Q.T
+                M = np.diag(Q.T * np.linalg.inv(X) * Q)
+                jdx = np.argmax(M)
+                step_size = (M[jdx]-d-1.0)/((d+1)*(M[jdx]-1.0))
+                new_u = (1-step_size)*u
+                new_u[jdx] += step_size
+                err = np.linalg.norm(new_u-u)
+                u = new_u
+            c = u*points
+            A = np.linalg.inv(points.T*np.diag(u)*points - c.T*c)/d    
+            return np.asarray(A), np.squeeze(np.asarray(c))
+
+        # Make sure the dtype is float. It sometimes is object
+        obstacle = obstacle if obstacle.dtype==float else np.array(obstacle, dtype=float)
+        ob = mvee(obstacle, tol=.05)
+
+        self.times['obstacle_as_ellipse'].append(perf_counter_ns() - start_time)
+        return ob
+
+    def obstacles_as_ellipses(self, obstacles):
+        if not type(obstacles).__module__ == np.__name__: obstacles = np.array(obstacles)
+        if obstacles.shape[1] == 0: return np.array([[]])
+
+        obs = []
+        for ob in obstacles:
+            A, c = self.obstacle_as_ellipse(ob)
+            obs.append(np.concatenate((np.reshape(A, -1), c)))
+        
+        return obs
+        
+    def obs_as_shapely_polygon(self, obstacles):
+        return [shapely.geometry.Polygon(ob) for ob in obstacles]
+
+    def obstacles_as_triangles(self, obstacles):
+        return [self.obstacle_as_triangle(ob) for ob in obstacles]
+
+    def obstacle_as_triangle(self, obstacle):
+        start_time = perf_counter_ns()
+
+        def mark_domains(ct, start_face, index, edge_border, face_info):
+            if face_info[start_face].nesting_level != -1:
+                return
+            queue = [start_face]
+            while queue != []:
+                fh = queue[0]     # queue.front
+                queue = queue[1:]  # queue.pop_front
+                if face_info[fh].nesting_level == -1:
+                    face_info[fh].nesting_level = index
+                    for i in range(3):
+                        e = (fh, i)
+                        n = fh.neighbor(i)
+                        if face_info[n].nesting_level == -1:
+                            if ct.is_constrained(e):
+                                edge_border.append(e)
+                            else:
+                                queue.append(n)
+
+        def mark_domain(cdt):
+            """Find a mapping that can be tested to see if a face is in a domain
+            Explore the set of facets connected with non constrained edges, 
+            and attribute to each such set a nesting level.
+            We start from the facets incident to the infinite vertex, with a
+            nesting level of 0. Then we recursively consider the non-explored
+            facets incident to constrained edges bounding the former set and
+            increase the nesting level by 1.
+            Facets in the domain are those with an odd nesting level.
+            """
+            face_info = {}
+            for face in cdt.all_faces():
+                face_info[face] = FaceInfo2()
+            index = 0
+            border = []
+            mark_domains(cdt, cdt.infinite_face(), index+1, border, face_info)
+            while border != []:
+                e = border[0]       # border.front
+                border = border[1:]  # border.pop_front
+                n = e[0].neighbor(e[1])
+                if face_info[n].nesting_level == -1:
+                    lvl = face_info[e[0]].nesting_level+1
+                    mark_domains(cdt, n, lvl, border, face_info)
+            return face_info
+
+        def insert_polygon(cdt, polygon):
+            if not polygon:
+                return
+
+            handles = [cdt.insert(polypt) for polypt in polygon]
+            for i in range(len(polygon)-1):
+                cdt.insert_constraint(handles[i], handles[i+1])
+            cdt.insert_constraint(handles[-1], handles[0])
+
+        def get_coords(cdt, face_info):
+            coords = []
+            for face in cdt.finite_faces():
+                if face_info[face].in_domain():
+                    coords.append([(face.vertex(i).point().x(), face.vertex(i).point().y()) for i in range(3)])
+
+            return coords
+
+
+
+        # Make sure the last coordinate isn't the same as the first
+        obstacle = obstacle if not np.all(obstacle[0] == obstacle[-1]) else obstacle[:-1]
+
+        polygon = [Point_2(coord[0], coord[1]) for coord in obstacle]
+
+        cdt = Constrained_Delaunay_triangulation_2()
+        insert_polygon(cdt, polygon)
+
+        # Mark facest that are inside the domain bounded by the polygon
+        face_info = mark_domain(cdt)
+
+        # Extract the triangles
+        triangles = get_coords(cdt, face_info)
+
+        self.times['obstacle_as_triangle'].append(perf_counter_ns() - start_time)
+        return triangles
+    
+    def obstacles_as_inequalities(self, obstacles):
+        """
+        Returns the obstacles in a list of lists of flattened b and a: [[b0 a0^T] ... [bn an^T]]
+        """
+        obs_equations = []
+        for ob in obstacles:
+            # Convert the obstacle into line inequalities and add them to the list
+            A, b = self.obstacle_as_inequality(np.mat(np.vstack(ob.exterior.xy).T.ravel().reshape(-1, 2)))
+            obs_array = np.array(np.concatenate((b, A), axis = 1)).reshape(-1)
+            obs_equations.append(obs_array)
+        
+        return obs_equations
+    
+    def obstacle_as_inequality(self, Vs):
+        # def vert2con(Vs):
+        '''
+        Compute the H-representation of a set of points (facet enumeration).
+        Arguments:
+            Vs: np.mat(np.array([[x0, y0], [x1, y1], [x2, y2]]))
+        Returns:
+            A   (L x d) array. Each row in A represents hyperplane normal.
+            b   (L x 1) array. Each element in b represents the hyperpalne
+                constant bi
+        Taken from https://github.com/d-ming/AR-tools/blob/master/artools/artools.py
+        '''
+        start_time = perf_counter_ns()
+
+        hull = scipy.spatial.ConvexHull(Vs)
+        K = hull.simplices
+        c = np.mean(Vs[hull.vertices, :], 0)  # c is a (1xd) vector
+
+        # perform affine transformation (subtract c from every row in Vs)
+        V = Vs - c
+
+        A = scipy.NaN * np.empty((K.shape[0], Vs.shape[1]))
+
+        rc = 0
+        for i in range(K.shape[0]):
+            ks = K[i, :]
+            F = V[ks, :]
+
+            if np.linalg.matrix_rank(F) == F.shape[0]:
+                f = np.ones(F.shape[0])
+                A[rc, :] = scipy.linalg.solve(F, f)
+                rc += 1
+
+        A = A[0:rc, :]
+        b = np.dot(A, c.T) + 1.0
+
+        self.times['obstacle_as_inequality'].append(perf_counter_ns() - start_time)
+        return (A, b)
+
+    def bounds_to_obstacles_and_convex_hull(self, boundry_original):
+        """[summary]
+
+        Args:
+            boundry_original ([type]): [description]
+
+        Returns:
+            List of list: tuple coordinates of obstacles
+            List: tuple coordinates of the convex boundry
+        """
+        org = shapely.geometry.Polygon(boundry_original)
+        convex_part=org.convex_hull
+        # Get the difference between original boundry and convex hull
+        nonconvex_part = convex_part.symmetric_difference(org)
+
+        extra_obs_list_coords = []
+        if nonconvex_part.geom_type == 'MultiPolygon':
+        # extract polygons out of multipolygon
+                for polygon in nonconvex_part:
+                        x,y = polygon.exterior.xy
+                        coords = []
+                        #Probably exist an easier way of putting coordinates into lists
+                        for i in range(len(x)):
+                                coords.append((x[i],y[i]))
+
+                        # Make sure the last coordinate isn't the same as the first
+                        coords = coords if not np.all(coords[0] == coords[-1]) else coords[:-1]
+                        extra_obs_list_coords.append(coords)
+
+        elif nonconvex_part.geom_type =='Polygon' and nonconvex_part.area > 0 :
+                x,y = nonconvex_part.exterior.xy
+                coords = []
+                for i in range(len(x)):
+                        coords.append((x[i],y[i]))
+
+                # Make sure the last coordinate isn't the same as the first
+                coords = coords if not np.all(coords[0] == coords[-1]) else coords[:-1]
+                extra_obs_list_coords.append(coords)
+        else:
+                extra_obs_list_coords = None
+
+        # Make boundry into tuple list 
+        x_boundry, y_boundry = convex_part.exterior.xy
+        convex_boundry = []
+        for i in range(len(x_boundry)):
+                convex_boundry.append((x_boundry[i],y_boundry[i]))
+        
+
+        # Make sure the last coordinate isn't the same as the first
+        convex_boundry = convex_boundry if not np.all(convex_boundry[0] == convex_boundry[-1]) else convex_boundry[:-1]
+        return extra_obs_list_coords, convex_boundry
+
+    def dist2closest_dyn_obs(self, point, poly_list):
+        """[summary]
+
+        Args:
+            point ([type]):  ( tuple )
+            poly_list ([type]): poly_list: [ob1 :[ob1_t0, ob1_t1 ,...], ob2 : [ob2_t0,]]
+
+        Returns:
+            [type]: minimum dist from point to obs in list 
+        """
+        current_pos = shapely.geometry.Point(point)
+        min_dist = None
+        for obstacle in poly_list: 
+            # only consider objects at time t = 0 
+            dist = current_pos.distance(obstacle[0]) 
+            
+            if min_dist is None:
+                min_dist = dist
+            elif dist < min_dist:
+                min_dist = dist
+
+        return min_dist
+
+    @property
+    def boundry(self):
+        """Returns the padded boundry
+
+        Returns:
+            list: Padded boundry
+        """
+        return self._boundry_padded
+    
+    @boundry.setter
+    def boundry(self, boundry):
+        """Sets the boundry. Pads it with the vehicle width/2.
+
+        Args:
+            boundry (List of tuples): List containing the vertices as tuples in ccw order: [(x0, y0), (x1, y1) ...]
+        """
+        self._boundry_original = np.array(boundry.copy())
+        self._boundry_padded = self.pad_obstacles(np.array([self._boundry_original.tolist()]), decrease=True)[0]
+
+    @property
+    def dynamic_obstacles(self):
+        """Gets dynamic obstacles
+
+        Returns:
+            List of lists of floats: List of lists of floats that contain the variables 
+            for dynamic obstacles represented as ellipses, (x-c).T * A * (x-c) = 1. The 
+            vectors and matrices are reshaped to be flat. One equation would be represented
+            as [A.reshape(-1) c]. The length of this is 6. The total shape is:
+            (n_obs, trajectory_length, 6)
+        """
+        self._dyn_original_obs, self._dyn_padded_obs, self._dynamic_obstacles_shapely
+    
+    @dynamic_obstacles.setter
+    def dynamic_obstacles(self, obs):
+        """Setter for the dynamic obstacles. Automatically pads the obstacles and converts the into ellipse equations.
+
+        Args:
+            obs (List of lists of tuples): Shape of obs is (n_obs, trajectory_length, n_vertices)
+        """
+
+        start_time = perf_counter_ns()
+
+        # If there are no obstacles
+        if not np.all(np.array(obs).shape):
+            self._dynamic_original_obs = np.array([[[[]]]])
+            self._dynamic_padded_obs = np.array([[[[]]]])
+            self._dynamic_obstacles_shapely = np.array([[[[]]]])
+            return
+
+        # This should maybe only be done with the closest obstacles
+        self._dynamic_original_obs = np.array(obs.copy())
+        self._dynamic_padded_obs = self.pad_obstacles(self._dynamic_original_obs, dynamic=True)
+        self._dynamic_obstacles_shapely = [self.obs_as_shapely_polygon(ob) for ob in self._dynamic_padded_obs]
+
+        self.times['set_dynamic'].append(perf_counter_ns() - start_time)
+
+    @property
+    def static_obstacles(self):
+        """Gets the static obstacles.
+
+        Returns:
+            Tuple: Returns a tuple of the original static obstacles and the padded static obstacles and their shapely 
+            representation (static_original_obs, static_padded_obs, static_obstacles_shapely) 
+        """
+        return self._static_original_obs, self._static_padded_obs, self._static_obstacles_shapely
+        
+    @static_obstacles.setter
+    def static_obstacles(self, obs):
+        """Setter for the static obstacles. Automatically pads them.
+
+        Args:
+            obs (List of lists of tuples): Shape of obs is (n_obs, trajectory_length, n_vertices)
+        """
+        start_time = perf_counter_ns()
+
+        self._static_original_obs = np.array(obs.copy(), dtype=object)
+        # self._static_original_obs = np.array(obs.copy())
+        self._static_padded_obs = self.pad_obstacles(self._static_original_obs)
+        self._static_obstacles_shapely = self.obs_as_shapely_polygon(self._static_padded_obs)
+
+        self.times['set_static'].append(perf_counter_ns() - start_time)
+
+    @property
+    def unexpected_obstacles(self):
+        """Gets the unexpected obstacles.
+
+        Returns:
+            Tuple: Returns a tuple of the original unexpected obstacles and the padded unexpected obstacles and their shapely 
+            representation (unexpected_original_obs, unexpected_padded_obs, unexpected_obstacles_shapely) 
+        """
+        return self._unexpected_original_obs, self._unexpected_padded_obs, self._unexpected_obstacles_shapely
+
+    @unexpected_obstacles.setter
+    def unexpected_obstacles(self, obs):
+        """Setter for the unexpected obstacles. Automatically pads them.
+
+        Args:
+            obs (List of lists of tuples): Shape of obs is (n_obs, trajectory_length, n_vertices)
+        """
+
+        start_time = perf_counter_ns()
+
+        # self._unexpected_original_obs = np.array(obs.copy())
+        self._unexpected_original_obs = obs.copy()
+        self._unexpected_padded_obs = self.pad_obstacles(self._unexpected_original_obs)
+        self._unexpected_obstacles_shapely = self.obs_as_shapely_polygon(self._unexpected_padded_obs)
+
+        self.times['set_unexpected'].append(perf_counter_ns() - start_time)
+
+    @staticmethod
+    def plot_obs(c, obs, ax, where_to_store_paintings):
+        for ob in obs:
+            x = [x for x, y in ob]
+            y = [y for x, y in ob]
+            x.append(x[0])
+            y.append(y[0])
+
+            tmp, = ax.plot(x, y, c=c)
+            where_to_store_paintings.append(tmp)
+
+    def solve_mvee(self):
+        x = symbols('x')
+        y = symbols('y')
+
+        x0 = symbols('x0')
+        y0 = symbols('y0')
+        a = symbols('a')
+        b = symbols('b')
+        d = symbols('c')
+        e = symbols('d')
+
+        x_bar = x-x0
+        y_bar = y-y0
+        eq = 1 - (x_bar*(a*x_bar+b*y_bar) + y_bar*(d*x_bar+e*y_bar))
+        sol = solve(eq,x)
+
+        syms = [x0, y0, a, b, d, e, y]
+        sol_v1 = sol[0]
+        sol_v2 = sol[1]
+
+        # Create functions to quickly evaluate the equations
+        sol_v1 = lambdify(syms, sol_v1, "numpy")
+        sol_v2 = lambdify(syms, sol_v2, "numpy")
+        self.mvee_solutions = [sol_v1, sol_v2]
+
+    def calc_point_on_mvee(self, c, A):
+
+        # Evaluate to see if the coordiante is on the ellipse
+        vals = np.hstack((c,A.reshape(-1)))
+        vals = np.repeat(vals.reshape(1,-1), self.plot_config['obs_dyn_n_points'], axis=0)
+        ys = np.linspace(c[1]-self.plot_config['obs_dyn_max_size']/2, c[1]+self.plot_config['obs_dyn_max_size']/2, num=self.plot_config['obs_dyn_n_points'])
+        ys_flipped = np.flip(ys)
+        vals1 = np.hstack((vals, ys.reshape(-1,1)))
+        vals2 = np.hstack((vals, ys_flipped.reshape(-1,1)))
+        solution_1 = np.array([])
+        solution_2 = np.array([])
+        with ignore_warnings(RuntimeWarning):
+            for i in range(vals1.shape[0]):
+                s1 = self.mvee_solutions[0](*vals1[i])
+                solution_1 = np.hstack((solution_1, s1))
+                s2 = self.mvee_solutions[1](*vals2[i])
+                solution_2 = np.hstack((solution_2, s2))
+
+        # Combine the results
+        xs = np.hstack((solution_1, solution_2))
+        ys = np.hstack((ys, ys_flipped))
+
+        # Prune the nans from ys and xs
+        extract_rule = np.logical_not(np.isnan(xs))
+        ys = ys[extract_rule]
+        xs = xs[extract_rule]
+
+        return xs, ys
+
+    def polygon_to_coord_plotable(self, data, mvee=True, polygon=False):
+        if mvee and not polygon:
+            Ac = data
+            assert Ac.shape == (6,), f"The shape of the data equations must be (6,) when mvee=True, it was: {Ac.shape}. It must be so that Ac = [A[0,0] A[0,1] A[1,0] A[1,1] c[0], c[1]]."
+        elif polygon and not mvee:
+            A, c  = self.obstacle_as_ellipse(data)
+            Ac = np.hstack((A.reshape(-1), c))
+        else:
+            raise ValueError("Either mvee or polygon must be true. Not both, not none.")
+            
+
+        xs, ys = self.calc_point_on_mvee(Ac[4:], Ac[:4])
+        data  = np.vstack((xs,ys)).T
+        return data
+
+    def plot(self):
+        start_time = perf_counter_ns()
+        
+        # Plot all obstacles unpadded
+        if self.plot_config['enable_original_obs']:
+            obs = []
+            if np.all(self._static_original_obs.shape):
+                obs += [ob for ob in  self._static_original_obs]
+            if np.all(len(self._unexpected_original_obs)):
+                obs += [ob for ob in  self._unexpected_original_obs]
+            if np.all(self._dynamic_original_obs.shape):
+                obs += [ob for ob in self._dynamic_original_obs[:, 0, :, :]]
+                # Plot the future positions of the dynamic obstacles
+                if self.plot_config['plot_future_dyn_obs']:
+                    obs += [ob for ob in self._dynamic_original_obs[:, self.config.n_hor -1, :, :]]
+                
+            try: self.plot_queues['obstacles_original'].put_nowait(obs)
+            except Full: pass
+
+
+        # Plot all obstacles padded
+        obs = []
+        if np.all(self._static_padded_obs.shape):
+            obs += [ob for ob in  self._static_padded_obs]
+        if np.all(self._unexpected_padded_obs.shape):
+            obs += [ob for ob in  self._unexpected_padded_obs]
+        if np.all(self._dynamic_padded_obs.shape):
+            if not self.plot_config['enable_ellipses']:
+                # Plot the polygon representation of the dynamic obstacles
+                obs += [ob for ob in self._dynamic_padded_obs[:, 0, :, :]]
+                # Plot the future positions of the dynamic obstacles
+                if self.plot_config['plot_future_dyn_obs']:
+                    obs += [ob for ob in self._dynamic_padded_obs[:, self.config.n_hor -1, :, :]]
+            
+
+            if self.plot_config['enable_ellipses']:
+                # Plot the ellipse representation of the dynamic obstacles
+                obs += [self.polygon_to_coord_plotable(ob, mvee=False, polygon=True) for ob in self._dynamic_padded_obs[:, 0, :, :]]
+                # Plot the future positions of the dynamic obstacles
+                if self.plot_config['plot_future_dyn_obs']:
+                    obs += [self.polygon_to_coord_plotable(ob, mvee=False, polygon=True) for ob in self._dynamic_padded_obs[:, self.config.n_hor -1, :, :]]
+
+        try: self.plot_queues['obstacles_padded'].put_nowait(obs)
+        except Full: pass
+
+        # Plot boundry
+        data = np.vstack((self._boundry_padded, self._boundry_padded[0])).T
+        try: self.plot_queues['boundry'].put_nowait(data)
+        except Full: pass
+
+
+        self.times['plot'].append(perf_counter_ns() - start_time)
+
+    def get_closest_static_obstacles(self, cur_pos):
+        """Returns the shapely representation of the closest static and unexpected obstacles to cur_pos. How many is determined by self.config.n_obs_of_each_vertices.
+
+        Args:
+            cur_pos ([type]): [description]
+
+        Returns:
+            dictionary: Dictionary with keys: [self.config.min_vertices:self.config.max_vertices] which contain the closest obstacles
+        """
+        start_time = perf_counter_ns()
+
+        # Convert all concave objects into convex ones
+
+        
+        n_hornings = {n:[] for n in range(self.config.min_vertices, self.config.max_vertices+1)}
+        
+        # Function for if any of the polygons are too high dimensional, reduce them by turning them into triangles
+        def reduce_dim(ob):
+            return concave_to_convex(ob)
+        
+        def concave_to_convex(ob):
+            ob = self.obstacle_as_triangle(np.array(ob.exterior.xy).T)
+            ob = self.obs_as_shapely_polygon(ob)
+            # pad the obstacles
+            ob_pad = pad_triangles(ob)
+            return ob_pad
+
+        # Function for padding the triangles a bit
+        def pad_triangles(ob):
+            ob_pad = []
+            for ob_ in ob:
+                # Pad them so that the smallest increase is 5 mm
+                x,y = ob_.exterior.xy
+                x = np.array(x)
+                y = np.array(y)
+                xdist = np.abs(x.max()-x.min())
+                xfact = (xdist + 0.05)/xdist
+                ydist = np.abs(y.max()-y.min())
+                yfact = (ydist + 0.05)/ydist
+                ob_pad.append(shapely.affinity.scale(ob_, xfact=xfact, yfact=yfact, origin='center'))
+            return ob_pad
+
+        # Sort the n_nornings
+        def sort_hornings(obs):
+            for ob in obs:
+                # Check if the polygon is concave and if so convert it into triangles and pad the triangles a bit
+                if ob.area < ob.convex_hull.area:
+                    ob_convex = concave_to_convex(ob)
+                    n_hornings[3].extend(ob_convex) 
+                # If it's too high dimensional, reduce it. They will be reduced to triangles
+                elif len(ob.exterior.xy[0]) > self.config.max_vertices:
+                    ob_reduced = reduce_dim(ob)
+                    n_hornings[3].extend(ob_reduced) 
+                else: 
+                    n = len(ob.exterior.xy[0]) - 1
+                    n_hornings[n].append(ob)
+        
+        sort_hornings(self._static_obstacles_shapely)
+        sort_hornings(self._unexpected_obstacles_shapely)
+        
+        # Find the closest obstacles of each horning type
+        n_closest = {n:[] for n in range(self.config.min_vertices, self.config.max_vertices+1)}
+        cur_pos = shapely.geometry.Point(cur_pos)
+        for n in n_closest:
+            obs = n_hornings[n]
+            if len(obs) == 0: continue
+            
+            # Find the obs with the smallest distance
+            dist = {}
+            for ob in obs:
+                d = ob.exterior.distance(cur_pos)
+                # See if there is another shape with the exact same distance, if so add to it
+                try:
+                    dist[d].append(ob)
+                except KeyError:
+                    dist[d] = [ob]
+
+            max_allowed_obstacles = self.config.n_obs_of_each_vertices #TODO: Add special case for triangles
+            if len(dist) <= max_allowed_obstacles: 
+                smallest_dist = dist.keys()
+            else:
+                smallest_dist = np.partition(list(dist.keys()), max_allowed_obstacles)[:max_allowed_obstacles]
+                smallest_dist = np.sort(list(smallest_dist))
+
+            # If there are more than one polygon with the same distance it's possible that 
+            # len(n_closest[n]) is bigger than the allowed number of obstacles. So we must remove if there are too many
+            closest = []
+            for d in smallest_dist: closest.extend(dist[d])
+            n_closest[n] = closest[:max_allowed_obstacles] 
+
+
+        self.times['get_closest_obs'].append(perf_counter_ns() - start_time)
+        return n_closest
+
+    def get_closest_dynamic_obstacles(self, cur_pos):
+        """Returns the equation representation of the closest dynamic obstacles to cur_pos for each timestep in self.config.n_hor.
+        Only the obstacles which are closest in the first time step are returned. So if one obstacle comes closer in the future it 
+        still isn't considered.
+        How many is determined by self.config.n_obs_of_each_vertices.
+
+        Args:
+            cur_pos ([type]): [description]
+
+        Returns:
+            List: List with the variables A and c in (x-c).T * A * (x-c) = 1, flattened, as [[A0 c0], [A1 c1]...]
+        """
+        #TODO: Examine if there is a bug when two obstacles are on the exact same distance from eachother
+        start_time = perf_counter_ns()
+
+        # Find the closest obstacles
+        obs = self._dynamic_padded_obs
+        if not np.all(obs.shape): return []
+        
+        shapely_obs = np.array(self._dynamic_obstacles_shapely)[:, 0]
+
+        cur_pos = shapely.geometry.Point(cur_pos)
+        dist = {ob.exterior.distance(cur_pos):i for i, ob in enumerate(shapely_obs)}
+        if len(shapely_obs) <= self.config.n_dyn_obs:
+            smallest_dist = range(0, len(shapely_obs))
+        else:
+            smallest_dist = np.argpartition(list(dist.keys()), self.config.n_dyn_obs)[:self.config.n_dyn_obs]
+
+        self.times['get_closest_obs'].append(perf_counter_ns() - start_time)
+        return [self._dynamic_obstacles_shapely[i] for i in smallest_dist] # It should also return it's padded polygon counterpart
+        
+
+        

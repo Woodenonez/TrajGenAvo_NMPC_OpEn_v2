@@ -1,0 +1,68 @@
+init_states: 6
+	x_init_master
+	x_init_slave
+
+Ref_states: 6
+	x_ref_master
+	x_ref_slave
+
+Init vel: 4
+	u_init_master
+	u_init_slave
+
+Init acc: 4
+	acc_init_master
+	acc_init_slave
+
+Constraint: 5
+	distance
+	distance_error_margin_lower_bound
+	distance_error_margin_upper_bound
+	formation_angle
+	formation_angle_error_margin
+
+# Weights: 20
+	q_lin_v: 1      # Cost for linear velocity control action
+	q_lin_acc: 1.0    # Cost for linear acceleration 
+	q_lin_jerk
+	q_ang: 1.0      # Cost angular velocity control action
+	q_ang_acc: 1    # Cost angular acceleration
+	q_ang_jerk
+	q_cte: 50        # Cost for cross-track-error from each line segment
+	q_pos: 0.0                 # Cost for position deviation (each time step vs reference point)
+	q_du: 0                # Cost for speed deviation each time step
+	q_theta: 0.0             # Cost for each heading relative to the final refernce position
+	q_pos_N: 50                # Terminal cost; error relative to final reference position         
+	q_theta_N: 0.0  
+	q_distance
+	q_theta_diff
+	q_distance_c
+	q_obs_c
+	q_dyn_obs_c
+	enable_distance_constraint
+	q_formation_ang
+
+vel refs: 80 
+	u_ref_master #n_hor * nu
+	u_ref_slave
+
+path refs: 120
+	path_ref # nx*n_hor
+
+#Static & unexpected 
+#sum(range(min_vertices, max_vertices+1))*3*n_obs_of_each_vertices
+
+	#Triangles
+	#3x3 n_obs_of_each_vertices
+
+	# Squares/rectangles
+	#3x4 * n_obs_of_each_vertices
+
+#Dynamic
+
+6 x N_hor *  n_dyn_obs # could improve¨
+
+
+
+
+

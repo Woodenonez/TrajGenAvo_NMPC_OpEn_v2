@@ -1,0 +1,8 @@
+# Build parameters
+
+#sum(range(min_vertices, max_vertices+1)) *3 *n_obs_of_each_vertices
+6 x N_hor *  n_dyn_obs # could improve
+#Boundry
+3 x n_boundry_verticies
+
+shape:(1018, 1)

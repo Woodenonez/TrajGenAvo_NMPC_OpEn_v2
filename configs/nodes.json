@@ -1,0 +1,14 @@
+{
+    "nodes" :[
+        {
+            "node1":
+             {"coord": "5,9",
+             "neighbor": "5,8"}
+        },
+        {
+            "node1":
+             {"coord": "5,9",
+             "neighbor": "5,8"}
+        }
+    ]
+}

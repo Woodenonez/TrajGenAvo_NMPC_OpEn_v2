@@ -1,0 +1,32 @@
+x_init : [0:6]
+  x_master
+  y_master
+  theta_master
+  x_slave
+  y_slave
+  theta_slave
+last_u : [6:10]
+  vel_init_master
+  ang_init_master
+  vel_init_slave
+  ang_init_slave
+x_finish : [10:13]
+  xref_master
+  yref_master
+  thetaref_master
+parameter_list : [13:23]
+  q_pos
+  q_du
+  q_theta
+  q_lin_v
+  q_ang
+  q_pos_N
+  q_theta_N
+  q_cte
+  q_lin_acc
+  q_ang_acc
+velref_master : [23:23+n_hor] #
+angref_master
+
+len(x_init+last_u+x_finish+parameter_list+vel_ref)
+43

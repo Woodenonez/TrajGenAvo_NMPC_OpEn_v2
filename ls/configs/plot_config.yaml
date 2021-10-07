@@ -1,0 +1,138 @@
+enable_ellipses: True     # If the dynamic obstacles should be plotted as ellipses
+plot_future_dyn_obs: False # If the future positions of the dynamic obstacles should be plotted
+enable_original_obs: True # If the unpadded obstacles should be plotted
+plot_slave: True         # If the slave should be plotted
+
+
+
+master_start_color: &master_color b
+master_path_color: *master_color
+master_end_color: *master_color
+master_robot_color: *master_color
+master_label: &master_label 'Leader' 
+master_vel_color: *master_color
+master_ang_color: *master_color
+master_vel_acc_color: &master_acc_color !!python/tuple [89, 29, 94, 155]
+master_ang_acc_color: *master_color 
+master_vel_jerk_color: *master_color 
+master_ang_jerk_color: &master_jerk_color !!python/tuple [100, 100, 100, 155] 
+
+slave_start_color: &slave_color !!python/tuple [255, 132, 0, 155]
+slave_path_color: *slave_color
+slave_end_color: *slave_color
+slave_robot_color: *slave_color
+slave_label: &slave_label 'Follower' 
+slave_vel_color: *slave_color
+slave_ang_color: *slave_color
+slave_vel_acc_color: &slave_acc_color !!python/tuple [199, 20, 20, 155] 
+slave_ang_acc_color: *slave_color 
+slave_vel_jerk_color: *slave_color 
+slave_ang_jerk_color: &slave_jerk_color !!python/tuple [1, 253, 140, 155]
+
+grey: !!python/tuple [110, 110, 110, 155]
+blue_see_through: !        self.mode = mode!python/tuple [0,0,255,155]
+
+obs_dyn_org_color: !!python/tuple [168, 50, 64]                     # Un-padded dynamic obstacle
+obs_dyn_pad_color: !!python/tuple [219, 11, 146]                        # Padded dynamic obstacle
+obs_dyn_pad_legend: Padded dynamic obstacle      # Padded dynamic obstacle
+obs_dyn_max_size: 25
+obs_dyn_n_points: 50
+
+obs_sta_org_color: r                             # Un-padded static obstacle
+obs_sta_pad_color: !!python/tuple [37, 94, 35, 155]                        # Padded static obstacle
+obs_sta_pad_legend: Padded static obstacle       # Padded static obstacle
+obs_org_legend: Original obstacle
+
+obs_un_org_color: !!python/tuple [219, 11, 146, 155]                              # Un-padded unexpected obstacle
+obs_un_pad_color: !!python/tuple [215, 89, 34, 155]                   # Padded unexpected obstacle
+obs_un_pad_legend: Padded unexpected obstacles   # Padded unexpected obstacle
+
+obs_sta_un_closest_color: !!python/tuple [90, 4, 4, 155]
+obs_sta_un_closest_legend: closest static unexpected obstacles
+
+node_color: 'm'
+node_label : 'Nodes'
+
+constraint_color: b
+constraint_legend: "Deviation-off-constraint"
+constraint_limit_legend: "Error margin"
+
+planned_path_color: !!python/tuple [0,0,0,155]
+planned_path_label: Planned-path
+
+
+look_ahead_color: !!python/tuple [98, 112, 101, 155]
+look_ahead_legend: look-ahead
+look_ahead_atr_line_color: k
+look_ahead_atr_line_legend: Line between atrs
+
+lines_master_color: !!python/tuple [230, 18, 54, 155]
+lines_slave_color: !!python/tuple [50, 168, 82, 155]
+lines_legend_master: Leader-lines
+lines_legend_slave: Follower-lines
+
+line_deviation_legend: line-deviation
+
+master_ref_point_color: *master_color
+master_ref_point_legend: Leader-ref-point
+slave_ref_point_color: *slave_color
+slave_ref_point_legend: Follower-ref-point
+
+
+cost_master_vel_color: *master_color
+cost_master_ang_color: *master_color
+cost_master_vel_acc_color: *master_acc_color 
+cost_master_ang_acc_color: *master_acc_color 
+cost_master_vel_jerk_color: *master_jerk_color 
+cost_master_ang_jerk_color: *master_jerk_color 
+
+cost_slave_vel_color: *slave_color
+cost_slave_ang_color: *slave_color
+cost_slave_vel_acc_color: *slave_acc_color 
+cost_slave_ang_acc_color: *slave_acc_color 
+cost_slave_vel_jerk_color: *slave_jerk_color 
+cost_slave_ang_jerk_color: *slave_jerk_color 
+
+cost_master_static_obs_color: *master_color
+cost_master_static_obs_legend: Leader-static-obstacles
+cost_master_dynamic_obs_color: *master_jerk_color
+cost_master_dynamic_obs_legend: Leader-dynamic-obstacles
+cost_master_future_dynamic_obs_color: *master_acc_color
+cost_master_future_dynamic_obs_legend: Leader-future-dynamic-obstacles
+cost_slave_static_obs_color: *slave_color
+cost_slave_static_obs_legend: Follower-static-obstacles
+cost_slave_dynamic_obs_color: *slave_jerk_color
+cost_slave_dynamic_obs_legend: Follower-dynamic-obstacles
+cost_slave_future_dynamic_obs_color: *slave_acc_color
+cost_slave_future_dynamic_obs_legend: Follower-future-dynamic-obstacles
+
+cost_master_ref_points_color: *master_color
+cost_master_ref_points_legend: Leader-ref-points
+cost_slave_ref_points_color: *slave_color
+cost_slave_ref_points_legend: Follower-ref-points
+
+cost_formation_color: *slave_jerk_color
+cost_formation_legend: Formation
+formation_color: *slave_jerk_color
+formation_legend: Formation
+
+
+cost_master_vel_ref_color: *master_acc_color
+cost_master_vel_ref_legend: Leader-ref-vel
+cost_slave_vel_ref_color: *slave_acc_color
+cost_slave_vel_ref_legend: Follower-ref-vel
+
+
+search_sector_color: *slave_jerk_color
+search_sector_legend: Search-sector
+
+
+planned_trajectory_master_color: !!python/tuple [195, 0, 255, 155]
+planned_trajectory_slave_color: !!python/tuple [99, 49, 2, 155]
+planned_trajectory_master_legend: Leader-line-traj
+planned_trajectory_slave_legend: Follower-line-traj
+
+
+
+
+
