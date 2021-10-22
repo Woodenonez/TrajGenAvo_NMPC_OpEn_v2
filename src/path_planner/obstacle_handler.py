@@ -1,22 +1,53 @@
 # Python imports
-import os 
+import os, sys, json
 from pathlib import Path
-import json
+from time import perf_counter_ns
 from queue import Full
+
+import numpy as np
+
 import pyclipper
 import shapely
-import numpy as np
-from sympy.utilities.iterables import reshape
-import scipy
-from time import perf_counter_ns
+
 from sympy import symbols, solve, lambdify
 from sympy.testing.pytest import ignore_warnings
+
 # Import CGAL, from own directory
 from CGAL.CGAL_Kernel import Point_2
 from CGAL.CGAL_Triangulation_2 import Constrained_Delaunay_triangulation_2
-# Own functiond
-from path_planner.obstacles import DynamicObstacle
 
+class DynamicObstacle:
+    def __init__(self, polygon, p1, p2, vel, n_steps_ahead):
+        """Creates a dynamic obstacle class
+
+        Args:
+            polygon (list of tuples ): The tuples describes the extremities of the polygon
+            p1 (tuple): start position
+            p2 (tuple): end position
+            dp (tuple): (dx, dy)
+        """
+        self.polygon = np.array(polygon, dtype='float')
+        self.center_pos = np.mean(self.polygon, axis=0)
+        self.p1 = np.array(p1)
+        self.p2 = np.array(p2)
+        self.vel = np.array(vel)
+
+        self.future_polygons = []
+        self.n_steps_ahead = n_steps_ahead
+
+    def update(self):
+        """Updates the current state to one step forward and updates future polygons with future polygons
+        """
+
+        def step(polygon, center_pos):
+            polygon += self.vel
+            center_pos = np.mean(polygon, axis=0)
+
+            return polygon, center_pos
+
+        for i in range(self.n_steps_ahead):
+            self.polygon, self.center_pos = step(self.polygon, self.center_pos)
+            self.future_polygons.append(self.polygon.copy())
 
 class FaceInfo2(object):
     def __init__(self):
@@ -35,12 +66,11 @@ class ObstacleHandler:
         self.times = {'set_dynamic':[], 'set_static':[], 'set_unexpected':[], 'get_closest_obs':[], 'obstacle_as_triangle':[], 'obstacle_as_inequality': [], 'obstacle_as_ellipse':[], 'plot':[]}
 
         # Calculate the algebraic solution to the mvee equations which represent dynamic obstacles
-        self.mvee_solutions = None
         self.solve_mvee()
         self.count = 0
 
     def get_boundry(self): 
-        map_fp = os.path.join(str(Path(__file__).parent.parent.parent), 'data', 'map.json')
+        map_fp = os.path.join(str(Path(__file__).parents[2]), 'data', 'map.json')
         with open(map_fp) as f: 
             map_json = json.load(f)
         extra_obs, new_bounds = self.bounds_to_obstacles_and_convex_hull(map_json['boundary'])
@@ -66,11 +96,11 @@ class ObstacleHandler:
         dynamic_obstacles_shapely = [self.obs_as_shapely_polygon(ob) for ob in dynamic_padded_obs]
         return dynamic_original_obs, dynamic_padded_obs, dynamic_obstacles_shapely
 
-    def update_obstacles(self):
+    def update_dynamic_obstacles(self):
         """Advances the dynamic obstacles 1 time step ahead
         """
        
-        obs_fp = os.path.join(str(Path(__file__).parent.parent.parent), 'data', 'obstacles_copy.json')
+        obs_fp = os.path.join(str(Path(__file__).parents[2]), 'data', 'obstacles_copy.json')
         with open(obs_fp) as f: 
             obs_json = json.load(f)
         
@@ -258,43 +288,38 @@ class ObstacleHandler:
             List: tuple coordinates of the convex boundry
         """
         org = shapely.geometry.Polygon(boundry_original)
-        convex_part=org.convex_hull
+        convex_part = org.convex_hull
         # Get the difference between original boundry and convex hull
         nonconvex_part = convex_part.symmetric_difference(org)
 
         extra_obs_list_coords = []
-        if nonconvex_part.geom_type == 'MultiPolygon':
-        # extract polygons out of multipolygon
-                for polygon in nonconvex_part:
-                        x,y = polygon.exterior.xy
-                        coords = []
-                        #Probably exist an easier way of putting coordinates into lists
-                        for i in range(len(x)):
-                                coords.append((x[i],y[i]))
-
-                        # Make sure the last coordinate isn't the same as the first
-                        coords = coords if not np.all(coords[0] == coords[-1]) else coords[:-1]
-                        extra_obs_list_coords.append(coords)
-
-        elif nonconvex_part.geom_type =='Polygon' and nonconvex_part.area > 0 :
-                x,y = nonconvex_part.exterior.xy
+        if nonconvex_part.geom_type == 'MultiPolygon': # extract polygons out of multipolygon
+            for polygon in nonconvex_part:
+                x,y = polygon.exterior.xy
                 coords = []
+                #Probably exist an easier way of putting coordinates into lists
                 for i in range(len(x)):
-                        coords.append((x[i],y[i]))
-
+                    coords.append((x[i],y[i]))
                 # Make sure the last coordinate isn't the same as the first
                 coords = coords if not np.all(coords[0] == coords[-1]) else coords[:-1]
                 extra_obs_list_coords.append(coords)
+        elif nonconvex_part.geom_type =='Polygon' and nonconvex_part.area > 0 :
+            x,y = nonconvex_part.exterior.xy
+            coords = []
+            for i in range(len(x)):
+                coords.append((x[i],y[i]))
+            # Make sure the last coordinate isn't the same as the first
+            coords = coords if not np.all(coords[0] == coords[-1]) else coords[:-1]
+            extra_obs_list_coords.append(coords)
         else:
-                extra_obs_list_coords = None
+            extra_obs_list_coords = None
 
         # Make boundry into tuple list 
         x_boundry, y_boundry = convex_part.exterior.xy
         convex_boundry = []
         for i in range(len(x_boundry)):
-                convex_boundry.append((x_boundry[i],y_boundry[i]))
+            convex_boundry.append((x_boundry[i],y_boundry[i]))
         
-
         # Make sure the last coordinate isn't the same as the first
         convex_boundry = convex_boundry if not np.all(convex_boundry[0] == convex_boundry[-1]) else convex_boundry[:-1]
         return extra_obs_list_coords, convex_boundry

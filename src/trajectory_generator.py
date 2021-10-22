@@ -1,66 +1,24 @@
 # Python imports
-from imp import get_magic
-from operator import le, mod
-from queue import Full
-from networkx.algorithms.structuralholes import constraint
-import numpy as np
-import math
-import time
+import os, sys, yaml
 from time import perf_counter_ns
-import traceback
-from enum import Enum
-import sys
 from pathlib import Path
-import os
-import json
-import yaml
+from queue import Full
+
+import numpy as np
+
 # Own imports
 from ATRS import ATRS
 from mpc.mpc_generator import MpcModule, get_length
-from utils.config import SolverParams
+
 from path_planner.path_planner import PathPlanner
-from panoc_nmpc_trajectory_problem import PanocNMPCTrajectoryProblem
 from path_planner.obstacle_handler import ObstacleHandler
-from utils.config import Configurator
+
+from panoc_nmpc_trajectory_problem import States
+from panoc_nmpc_trajectory_problem import PanocNMPCTrajectoryProblem
+
 from utils.plotter import start_plotter
 from utils.config import Configurator, SolverParams, Weights
 
-
-class States(Enum):
-    COUPLING = 0
-    FORMATION = 1
-    DECOUPLING = 2
-    DONE = 3
-
-    def transition(self, x, x_ref, atol=0.05, rtol=0.00001):
-        return np.allclose(x, x_ref, atol=atol, rtol=rtol) 
-
-    def next(self):
-        if self == States.COUPLING:
-            return States.FORMATION
-        elif self == States.FORMATION:
-            return States.DECOUPLING
-        elif self == States.DECOUPLING:
-            return States.DONE
-        elif self == States.DONE:
-            return None
-        else:
-            traceback.print_exc()
-            raise(Exception("This state doesn't exist!"))
-
-class RollingAvg:
-
-    def __init__(self, steps = 10) :
-        from collections import deque
-        self.steps = steps
-        self.past_values = deque(maxlen=int(steps))
-
-    def get_avg(self):
-        rolling_avg = np.sum(self.past_values)/self.steps
-        return rolling_avg
-
-    def update(self, x):
-        self.past_values.append(np.sum(x))
 
 class TrajectoryGenerator:
     """Class that generates control inputs. Uses solver_paramuration file in solver_params folder
@@ -73,15 +31,18 @@ class TrajectoryGenerator:
             MpcModule(solver_param).build()
         # Setup plot stuff
         self.plot_config = plot_config
-        self.verbose = verbose 
         self.plot_queues = plot_queues
         self.plot_process = plot_process
         self.self_destruct = self_destruct
+
+        self.verbose = verbose 
+
         self.times = {'loop_time':[], 'solver':[], 'static_to_eq':[], 'dyn_to_eq':[], 'plot':[]}
         self.solver_times = []
         self.overhead_times = []
         self.print_name = name
-        self.costs = {key : [] for key in self.plot_queues if 'cost' in key and not 'future' in key}
+
+        self.costs        = {key : [] for key in self.plot_queues if 'cost' in key and not 'future' in key}
         self.costs_future = {key : [] for key in self.plot_queues if 'cost' in key and 'future' in key}
         
         # Save solver parameters
@@ -93,9 +54,8 @@ class TrajectoryGenerator:
         self.solver = trajectory_generator_solver.solver()
 
         # Setup all the classes that are needed
-        self.robot_state = []
-        self.robot_state.extend(start_pose[0])
-        self.robot_state.extend(start_pose[1])
+        self.robot_state = start_pose[0] + start_pose[1] # (start_master, start_slave)
+
         self.robot_data = ATRS(start_pose[0], start_pose[1], solver_param, plot_config, plot_queues)
         self.obs_handler = ObstacleHandler(solver_param.base, plot_config, plot_queues)   
         self.path_planner = PathPlanner(solver_param.base, plot_config, plot_queues)  
@@ -106,7 +66,7 @@ class TrajectoryGenerator:
         self.initial_guess_master = None
         self.initial_guess_dual = None
         self.initial_guess_pos = None
-        self.u_previous = None
+        self.u_previous = [0]*self.solver_param.base.nu
         self.state = States.COUPLING
 
         # Variables for keeping track of plotting
@@ -125,9 +85,6 @@ class TrajectoryGenerator:
 
         # Flag for genereating 2s horizon
         self.two_seconds = False
-
-        # Some weird stuff
-        self.ra = RollingAvg(1e2) # TODO : fulfix 
 
     def load_params(self): 
         file_path = Path(__file__)
@@ -164,7 +121,6 @@ class TrajectoryGenerator:
 
         solver_param = SolverParams(base, line_follow_weights, traj_follow_weights, pos_goal_weights, line_follow_weights_aggressive, traj_follow_weights_aggressive)
         
-
         # Load plot config file
         plot_config = 'plot_config.yaml'
         plot_config_fp = os.path.join(str(file_path.parent.parent), 'configs', plot_config)
@@ -186,38 +142,26 @@ class TrajectoryGenerator:
         generated_trajectory = [[],[]]    
         
         while not done: 
-            x = tuple(self.robot_state)
-
+            x = self.robot_state
 
             # Local path planner, plans around unexpected obstacles
             _, static_padded_obs, _, _, unexpected_padded_obs, unexpected_obstacles_shapely = self.obs_handler.get_static_obstacles()
             boundry = self.obs_handler.get_boundry()
-            self.path_planner.local_path_plan(x[:3], unexpected_padded_obs, unexpected_obstacles_shapely,static_padded_obs, boundry)
+
+            self.path_planner.local_path_plan(x[:3], unexpected_padded_obs, unexpected_obstacles_shapely, static_padded_obs, boundry)
 
             # If the slave is disabled we shouldn't try to trajectory plan for it
             if not self.solver_param.base.enable_slave:
                 self.slave_end = list(x[3:])
    
             t = 0
-            search_sector = None # TODO:Maybe remove this
-
-            # Initialize lists
-            refs = [0.0] * (self.solver_param.base.n_hor * self.solver_param.base.nx)
-            #This is filled later anyway
-            constraints = [] 
-            dyn_constraints = []
-            if self.u_previous is None:
-                self.u_previous = [0]*self.solver_param.base.nu
-
-        
             start_time = perf_counter_ns()
-            x_cur = list(x) # I think this means that we cannot plan all the way to goal since we get the current position all the time
+            x_cur = list(x) # I think this means cannot plan all the way to goal since always get the current position
 
-            # Get the closest obstacles, update_obstacles() only used for simulatin
-            self.obs_handler.update_obstacles()
-            closest_obs_static = self.obs_handler.get_closest_static_obstacles(x_cur[:2])
+            # Get the closest obstacles, update_dynamic_obstacles() only used for simulatin
+            self.obs_handler.update_dynamic_obstacles()
+            closest_obs_static  = self.obs_handler.get_closest_static_obstacles(x_cur[:2])
             closest_obs_dynamic = self.obs_handler.get_closest_dynamic_obstacles(x_cur[:2])
-            boundry = self.obs_handler.get_boundry()
             
             # Generate obstacle constraints in Panoc terms
             constraints, closest_static_unexpected_obs = self.panoc.convert_static_obs_to_eqs(closest_obs_static)
@@ -226,11 +170,9 @@ class TrajectoryGenerator:
             bounds_eqs = self.panoc.convert_bounds_to_eqs(boundry)
 
             # Generate reference values
-            v_ref = self.panoc.generate_vel_ref(x_cur[:3])
             x_finish_master, line_vertices_master, goal_in_reach = self.panoc.generate_refs(x_cur, self.path_planner.path)
             slave_path = self.path_planner.path[0:-1] + [(self.slave_end[0], self.slave_end[1])]
             x_finish_slave, line_vertices_slave, _ = self.panoc.generate_refs(x_cur[3:], slave_path)
-            
             # Calculate reference angles
             formation_angle_ref = self.mpc_generator.calc_formation_angle_ref(x_cur[:3], *line_vertices_master[:3])
             ref_trajectory = None
@@ -245,21 +187,21 @@ class TrajectoryGenerator:
                 slave_ang_acc = (self.u_slave_prev[1]-self.u_slave_prev[3]) / self.solver_param.base.ts
                 prev_acc = [master_lin_acc, master_ang_acc, slave_lin_acc, slave_ang_acc]
             
-
+            '''
+            Running starts here
+            '''
             # Calculate trajectory when not in formation
             if self.state == States.COUPLING or self.state == States.DECOUPLING:
                 ref_cost, parameters, solution = self.panoc.gen_pos_traj(x_cur, self.master_end + self.slave_end, constraints, dyn_constraints, active_dyn_obs,  self.solver_param.base.vehicle_margin, 1e100, bounds_eqs, self.u_previous, self.initial_guess_pos, prev_acc)
                 self.initial_guess_pos = solution
-
             # Calculate trajectory when in formation
             elif self.state == States.FORMATION: 
                 # If goal is not in reach, follow the lines
                 if not goal_in_reach:
                     # Generate one trajectory for master
-                    ref_cost, parameters, solution, search_sector = self.panoc.gen_line_following_traj(x_cur, dyn_constraints, closest_dynamic_obs_poly, line_vertices_master, line_vertices_slave, formation_angle_ref, constraints, active_dyn_obs, self.solver_param.base.constraint['distance_lb'], self.solver_param.base.constraint['distance_ub'], self.solver_param.base.aggressive_factor, bounds_eqs, self.u_previous, self.initial_guess_master, prev_acc)
+                    ref_cost, parameters, solution = self.panoc.gen_line_following_traj(x_cur, dyn_constraints, line_vertices_master, line_vertices_slave, formation_angle_ref, constraints, active_dyn_obs, self.solver_param.base.constraint['distance_lb'], self.solver_param.base.constraint['distance_ub'], self.solver_param.base.aggressive_factor, bounds_eqs, self.u_previous, self.initial_guess_master, prev_acc)
                     self.initial_guess_master = solution
                     
-
                     if self.solver_param.base.enable_slave:
                         # Offset master trajectory to receive slave trajectory
                         trajectory = self.panoc.calculate_trajectory(solution[:2*2*self.solver_param.base.trajectory_length], x_cur[:3], x_cur[3:], self.plot_config)
@@ -267,7 +209,6 @@ class TrajectoryGenerator:
                         
                         ref_cost, parameters, solution = self.panoc.gen_traj_following_traj(ref_trajectory, solution, x_cur, formation_angle_ref, x_finish_master + x_finish_slave, constraints, dyn_constraints, active_dyn_obs, self.solver_param.base.constraint['distance_lb'], self.solver_param.base.constraint['distance_ub'], self.solver_param.base.aggressive_factor, bounds_eqs, self.u_previous, self.initial_guess_dual, prev_acc)
                         self.initial_guess_dual = solution
-                
                 # If goal is in reach, go to the goal
                 elif goal_in_reach:
                     if self.solver_param.base.enable_slave:
@@ -276,7 +217,6 @@ class TrajectoryGenerator:
                     else:
                         ref_cost, parameters, solution = self.panoc.gen_pos_traj(x_cur, self.master_end + self.slave_end, constraints, dyn_constraints, active_dyn_obs, self.solver_param.base.vehicle_margin, 1e100, bounds_eqs, self.u_previous, self.initial_guess_pos, prev_acc)
                         self.initial_guess_pos = solution
-
             else:
                 raise ValueError(f"Invalid state to be in: {self.state}!")
 
@@ -287,28 +227,21 @@ class TrajectoryGenerator:
             # From the control inputs calculate the trajectory using discretized robot model
             trajectory = self.panoc.calculate_trajectory(solution[:2*2*self.solver_param.base.trajectory_length], x_cur[:3], x_cur[3:], self.plot_config)
             # Update the state to the last position in the trajectory 
-            self.robot_state = []
             if self.two_seconds: 
-                self.robot_state.extend(trajectory[-1][0:3])
-                self.robot_state.extend(trajectory[-1][3:6])
+                self.robot_state = list(trajectory[-1][0:3]) + list(trajectory[-1][3:6])
             else: 
-                self.robot_state.extend(trajectory[0][0:3])
-                self.robot_state.extend(trajectory[0][3:6])
-
+                self.robot_state = list(trajectory[0][0:3])  + list(trajectory[0][3:6])
+            
             # Plot
             if plot:
-                
                 self.u_master_prev.extend(self.u_previous[0:2])
                 self.u_slave_prev.extend(self.u_previous[2:4])
-
                 if len(self.u_master_prev) > 4: 
                     self.u_master_prev.pop(0)
                     self.u_master_prev.pop(0)
                 if len(self.u_slave_prev) > 4: 
                     self.u_slave_prev.pop(0)
                     self.u_slave_prev.pop(0)
-
-
                 self.plot(trajectory, self.u_master_prev, self.u_slave_prev, generated_trajectory,solution[:2*2*self.solver_param.base.trajectory_length])
                 #time.sleep(0.5)
 
@@ -331,7 +264,7 @@ class TrajectoryGenerator:
             # Check if done with current state
             done_with_state = self.state.transition(x, self.master_end + self.slave_end)
             if done_with_state:
-                # TODO: This should maybe be published and we'll receive a command to move to the next state
+                # TODO: This should be published and we'll receive a command to move to the next state
                 if self.verbose:
                     print(f"{self.print_name} Finished with state: {self.state.name}, moving on to state: {self.state.next().name}")
                 self.state = self.state.next() 
@@ -344,15 +277,10 @@ class TrajectoryGenerator:
                     self.master_end = list(self.master_goal[self.state.value])
                     self.slave_end = list(self.slave_goal[self.state.value])
 
-            
-            # Print how much the distance constraint was max violated
             if done:
                 print("Finished the trajectory planning")
-
-
-            # If this doesn't happen then someone else has to stop this process and it's associated processes
-            if done and self.self_destruct:
-                self.kill()
+                if self.self_destruct:
+                    self.kill()
         
     
     def plot(self, trajectory, u_master_prev, u_slave_prev, past_trajectory, u):
@@ -365,7 +293,6 @@ class TrajectoryGenerator:
         dynamic_original_obs, dynamic_padded_obs, _ = self.obs_handler.get_dynamic_obstacles()
         boundry = self.obs_handler.get_boundry()
         self.obs_handler.plot(boundry, static_original_obs,static_padded_obs, unexpected_original_obs, unexpected_padded_obs, dynamic_original_obs, dynamic_padded_obs, self.panoc) 
-
         
         # Plot the closest static and unexpected obstacles
         start_time = perf_counter_ns()
@@ -395,7 +322,6 @@ class TrajectoryGenerator:
                 self.plot_queues['slave_path'].put_nowait(data)
                 self.plot_queues['slave_start'].put_nowait([[start_slave[0]], [start_slave[1]]])
                 self.plot_queues['slave_end'].put_nowait([[goal_positions[1][0]], [goal_positions[1][1]]])
-           
         except Full:
             pass
 
@@ -410,7 +336,6 @@ class TrajectoryGenerator:
             if self.solver_param.base.enable_slave and self.plot_config['plot_slave']:
                 data = [[x for x in traj_slave[:,0]], [y for y in traj_slave[:,1]]]
                 self.plot_queues['planned_trajectory_slave'].put_nowait(data)
-           
         except Full:
             pass
 
@@ -470,33 +395,26 @@ class TrajectoryGenerator:
             if self.plot_config['plot_slave']:
                 self.plot_queues['slave_lin_vel'].put_nowait([u_time, v_slave])
                 self.plot_queues['slave_ang_vel'].put_nowait([u_time, ang_slave])
-
             if np.all(u_time[1:].shape):
                 self.plot_queues['master_lin_acc'].put_nowait([u_time[1:], vel_acc_master])
                 self.plot_queues['master_ang_acc'].put_nowait([u_time[1:], ang_acc_master])
                 if self.plot_config['plot_slave']:
                     self.plot_queues['slave_lin_acc'].put_nowait([u_time[1:], vel_acc_slave])
                     self.plot_queues['slave_ang_acc'].put_nowait([u_time[1:], ang_acc_slave])
-
             if np.all(u_time[2:].shape):
                 self.plot_queues['master_lin_jerk'].put_nowait([u_time[2:], vel_jerk_master])
                 self.plot_queues['master_ang_jerk'].put_nowait([u_time[2:], ang_jerk_master])
                 if self.plot_config['plot_slave']:
                     self.plot_queues['slave_lin_jerk'].put_nowait([u_time[2:], vel_jerk_slave])
                     self.plot_queues['slave_ang_jerk'].put_nowait([u_time[2:], ang_jerk_slave])
-
             if self.plot_config['plot_slave'] and self.state == States.FORMATION:
                 if self.two_seconds: 
                     self.plot_queues['constraint'].put_nowait([u_time, np.array(constraint_dev)])
                 else: 
                     self.plot_queues['constraint'].put_nowait([u_time[1:], np.array(constraint_dev)])
-
         except Full:
             pass
 
-        
-
-        
         # Plot costs 
         all_positions_master = trajectory[:,0:2].T
         all_x_master = all_positions_master[0,:]
@@ -515,10 +433,7 @@ class TrajectoryGenerator:
             
         master_ref_point_cost = self.mpc_generator.cost_dist2ref_points(all_x_master, all_y_master, all_th_master, self.mpc_generator.ref_points_master_x, self.mpc_generator.ref_points_master_y,  self.mpc_generator.ref_points_master_th, self.mpc_generator.q_pos_master, self.mpc_generator.q_theta_master)
         slave_ref_point_cost = self.mpc_generator.cost_dist2ref_points( all_x_slave,  all_y_slave,  all_th_slave,  self.mpc_generator.ref_points_slave_x,  self.mpc_generator.ref_points_slave_y,   self.mpc_generator.ref_points_slave_th,  self.mpc_generator.q_pos_slave,  self.mpc_generator.q_theta_slave)
-        master_ref_point_N_cost = self.mpc_generator.cost_dist2ref_point_N(all_x_master[-1], all_y_master[-1], all_th_master[-1], self.mpc_generator.ref_points_master_x[-1], self.mpc_generator.ref_points_master_y[-1], self.mpc_generator.ref_points_master_th[-1], self.mpc_generator.q_pos_N, self.mpc_generator.q_theta_N)
-        slave_ref_point_N_cost =  self.mpc_generator.cost_dist2ref_point_N(all_x_slave[-1], all_y_slave[-1], all_th_slave[-1], self.mpc_generator.ref_points_slave_x[-1], self.mpc_generator.ref_points_slave_y[-1], self.mpc_generator.ref_points_slave_th[-1], self.mpc_generator.q_pos_N, self.mpc_generator.q_theta_N)
-        self.costs['cost_master_ref_points'].append(master_ref_point_cost + master_ref_point_N_cost)
-        self.costs['cost_slave_ref_points'].append(slave_ref_point_cost + slave_ref_point_N_cost)
+
         distance_cost = self.mpc_generator.cost_distance_between_atrs(all_x_master, all_y_master, all_x_slave, all_y_slave, self.mpc_generator.q_distance)
         distance_cost += self.mpc_generator.cost_distance_atr_soft_c( all_x_master, all_y_master, all_x_slave, all_y_slave, self.mpc_generator.q_distance_c)
         self.costs['cost_constraint'].append(distance_cost)
@@ -550,8 +465,6 @@ class TrajectoryGenerator:
         self.costs['cost_master_ang_vel'].append(float(master_ang_vel_cost))
         self.costs_future['cost_future_master_ang_vel'] = self.mpc_generator.cost_control(master_u, self.mpc_generator.q_lin_v, self.mpc_generator.q_ang, individual_costs=True)[1]
 
-
-
         past_u = [[],[]]
         past_u[0] = u_master_prev
         past_u[1] = u_slave_prev
@@ -560,37 +473,16 @@ class TrajectoryGenerator:
         master_ang_vel_init = 0 if len(past_u[0]) < 4 else past_u[0][-3]
         master_lin_acc, master_ang_acc = self.mpc_generator.calc_accelerations(master_u, master_lin_vel_init, master_ang_vel_init)
 
-        master_lin_acc_cost = self.mpc_generator.cost_acc_and_retardation(master_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_acc)        
+        master_lin_acc_cost = self.mpc_generator.cost_linear_acc(master_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_acc)        
         # master_lin_acc_cost += self.mpc_generator.cost_acc_constraint(master_lin_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c)
         self.costs['cost_master_lin_acc'].append(float(master_lin_acc_cost))
-        self.costs_future['cost_future_master_lin_acc'] = self.mpc_generator.cost_acc_and_retardation(master_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_acc, individual_costs=True)    
+        self.costs_future['cost_future_master_lin_acc'] = self.mpc_generator.cost_linear_acc(master_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_acc, individual_costs=True)    
 
-        master_ang_acc_cost = self.mpc_generator.cost_acc(master_ang_acc, self.mpc_generator.q_ang_acc)
+        master_ang_acc_cost = self.mpc_generator.cost_angular_acc(master_ang_acc, self.mpc_generator.q_ang_acc)
         # master_ang_acc_cost += self.mpc_generator.cost_acc_constraint(master_ang_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c)
         self.costs['cost_master_ang_acc'].append(float(master_ang_acc_cost))
-        self.costs_future['cost_future_master_ang_acc'] = self.mpc_generator.cost_acc(master_ang_acc, self.mpc_generator.q_ang_acc, individual_costs=True)
+        self.costs_future['cost_future_master_ang_acc'] = self.mpc_generator.cost_angular_acc(master_ang_acc, self.mpc_generator.q_ang_acc, individual_costs=True)
 
-        #Master jerk cost
-        if len(past_u[0]) >= 4:
-            master_lin_acc_init = (past_u[0][-4]-past_u[0][-2])/self.solver_param.base.ts
-            master_ang_acc_init = (past_u[0][-3]-past_u[0][-1])/self.solver_param.base.ts
-            master_lin_jerk, master_ang_jerk = self.mpc_generator.calc_jerk(master_lin_acc, master_ang_acc, master_lin_acc_init, master_ang_acc_init)
-
-            master_lin_jerk_cost = self.mpc_generator.cost_jerk(master_lin_jerk, self.mpc_generator.q_lin_jerk)
-            self.costs['cost_master_lin_jerk'].append(float(master_lin_jerk_cost))
-            self.costs_future['cost_future_master_lin_jerk'] = self.mpc_generator.cost_jerk(master_lin_jerk, self.mpc_generator.q_lin_jerk, individual_costs=True)
-
-            master_ang_jerk_cost = self.mpc_generator.cost_jerk(master_ang_jerk, self.mpc_generator.q_ang_jerk)
-            self.costs['cost_master_ang_jerk'].append(float(master_ang_jerk_cost))
-            self.costs_future['cost_future_master_ang_jerk'] = self.mpc_generator.cost_jerk(master_ang_jerk, self.mpc_generator.q_ang_jerk, individual_costs=True)
-
-        else:
-            self.costs['cost_master_lin_jerk'].append(0)
-            self.costs['cost_master_ang_jerk'].append(0)
-
-            #Future jerk costs should be plotted here but w/e
-
-        
         # Master line deviation cost
         # slave control signal costs
         slave_u = trajectory[:, [8, 9]].reshape(-1, 1)
@@ -605,48 +497,21 @@ class TrajectoryGenerator:
         slave_ang_vel_init = 0 if len(past_u[1]) < 4 else past_u[1][-3]
         slave_lin_acc, slave_ang_acc = self.mpc_generator.calc_accelerations(slave_u, slave_lin_vel_init, slave_ang_vel_init)
 
-        slave_lin_acc_cost = self.mpc_generator.cost_acc_and_retardation(slave_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_ret)        
-        slave_lin_acc_cost += self.mpc_generator.cost_acc_constraint(slave_lin_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c)
+        slave_lin_acc_cost = self.mpc_generator.cost_linear_acc(slave_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_ret)
         self.costs['cost_slave_lin_acc'].append(float(slave_lin_acc_cost))
-        self.costs_future['cost_future_slave_lin_acc'] = self.mpc_generator.cost_acc_and_retardation(slave_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_ret, individual_costs=True)   + self.mpc_generator.cost_acc_constraint(slave_lin_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c, individual_costs=True) #TODO: Somehow add these up
+        self.costs_future['cost_future_slave_lin_acc'] = self.mpc_generator.cost_linear_acc(slave_lin_acc, self.mpc_generator.q_lin_acc, self.mpc_generator.q_lin_ret, individual_costs=True) 
 
-        slave_ang_acc_cost = self.mpc_generator.cost_acc(slave_ang_acc, self.mpc_generator.q_ang_acc)
-        slave_ang_acc_cost += self.mpc_generator.cost_acc_constraint(slave_ang_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c)
+        slave_ang_acc_cost = self.mpc_generator.cost_angular_acc(slave_ang_acc, self.mpc_generator.q_ang_acc)
         self.costs['cost_slave_ang_acc'].append(float(slave_ang_acc_cost))
-        self.costs_future['cost_future_slave_ang_acc'] = self.mpc_generator.cost_acc(slave_ang_acc, self.mpc_generator.q_ang_acc, individual_costs=True) + self.mpc_generator.cost_acc_constraint(slave_ang_acc, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.mpc_generator.q_acc_c, individual_costs=True)
+        self.costs_future['cost_future_slave_ang_acc'] = self.mpc_generator.cost_angular_acc(slave_ang_acc, self.mpc_generator.q_ang_acc, individual_costs=True)
 
-        # Slave jerk cost
-        if len(past_u[0]) >= 4:
-            slave_lin_acc_init = (past_u[1][-4]-past_u[1][-2])/self.solver_param.base.ts
-            slave_ang_acc_init = (past_u[1][-3]-past_u[1][-1])/self.solver_param.base.ts
-            slave_lin_jerk, slave_ang_jerk = self.mpc_generator.calc_jerk(slave_lin_acc, slave_ang_acc, slave_lin_acc_init, slave_ang_acc_init)
-
-            slave_lin_jerk_cost = self.mpc_generator.cost_jerk(slave_lin_jerk, self.mpc_generator.q_lin_jerk)
-            self.costs['cost_slave_lin_jerk'].append(float(slave_lin_jerk_cost))
-            self.costs_future['cost_future_slave_lin_jerk'] = self.mpc_generator.cost_jerk(slave_lin_jerk, self.mpc_generator.q_lin_jerk, individual_costs=True)
-
-
-            slave_ang_jerk_cost = self.mpc_generator.cost_jerk(slave_ang_jerk, self.mpc_generator.q_ang_jerk)
-            self.costs['cost_slave_ang_jerk'].append(float(slave_ang_jerk_cost))
-            self.costs_future['cost_future_slave_ang_jerk'] = self.mpc_generator.cost_jerk(slave_ang_jerk, self.mpc_generator.q_ang_jerk, individual_costs=True)
-
-        else:
-            self.costs['cost_slave_lin_jerk'].append(0)
-            self.costs['cost_slave_ang_jerk'].append(0)
-
-        # Slave line deviation cost
-        # Constraints cost
-        # Vel ref costs
+        # Slave line deviation cost & Constraints cost & Vel ref costs
         vel_ref_cost = float(self.mpc_generator.cost_v_ref_difference(master_u.flatten(), np.array(self.mpc_generator.v_ref_master), self.mpc_generator.q_d_lin_vel_upper, self.mpc_generator.q_d_lin_vel_lower))
         vel_ref_cost += float(self.mpc_generator.cost_ang_vel_ref_difference(master_u.flatten(), np.array(self.mpc_generator.ang_vel_ref_master), self.mpc_generator.q_d_ang_vel))
         self.costs['cost_master_vel_ref'].append(vel_ref_cost)
         self.costs_future['cost_future_master_vel_ref'] = self.mpc_generator.cost_v_ref_difference(master_u.flatten(), np.array(self.mpc_generator.v_ref_master), self.mpc_generator.q_d_lin_vel_upper, self.mpc_generator.q_d_lin_vel_lower, individual_costs=True) + self.mpc_generator.cost_ang_vel_ref_difference(master_u.flatten(), np.array(self.mpc_generator.ang_vel_ref_master), self.mpc_generator.q_d_ang_vel, individual_costs=True) 
-        vel_ref_cost = float(self.mpc_generator.cost_reverse(slave_u[0::2], self.mpc_generator.q_reverse))
         self.costs['cost_slave_vel_ref'].append(vel_ref_cost)
-        self.costs_future['cost_future_slave_vel_ref'] = self.mpc_generator.cost_reverse(slave_u[0::2], self.mpc_generator.q_reverse, individual_costs=True)
         
-
-
         past_time = np.linspace(0, self.solver_param.base.ts*(len(self.costs['cost_master_line_deviation'])) - self.solver_param.base.ts, len(self.costs['cost_master_line_deviation']))
         future_time = np.linspace(0, self.solver_param.base.ts*(len(self.costs_future['cost_future_master_line_deviation'])) - self.solver_param.base.ts, len(self.costs_future['cost_future_master_line_deviation'])) + past_time[-1]
 
@@ -657,9 +522,9 @@ class TrajectoryGenerator:
                         self.plot_queues[key].put_nowait([past_time, self.costs[key]])
                 except KeyError:
                     print(f"Key not found:  {key}")
-
         except Full:
             pass
+
         try: # Try statement needed in case the queue is full
             for key in self.costs_future:
                 try:
@@ -668,10 +533,8 @@ class TrajectoryGenerator:
                         self.plot_queues[key].put_nowait([future_time, future_costs])
                 except KeyError:
                     print(f"Key not found:  {key}")
-
         except Full:
             pass
-
 
         self.times['plot'].append(perf_counter_ns() - start_time)
 

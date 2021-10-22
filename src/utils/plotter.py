@@ -1,9 +1,9 @@
-from queue import Empty
-from PyQt5 import QtCore, QtWidgets
-import pyqtgraph as pg
-import pyqtgraph.exporters
 import numpy as np
 import multiprocessing
+from queue import Empty
+
+from PyQt5 import QtCore, QtWidgets
+import pyqtgraph as pg
 
 def start_plotter(config, plot_config, aut_test_config=None, width=800, height=600):
     plot_queues_map  = {'master_path':multiprocessing.Queue(maxsize=1), 

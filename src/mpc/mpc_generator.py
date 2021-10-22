@@ -1,25 +1,22 @@
+import os, sys
+
+import traceback
+import numpy as np
+
 import opengen as og
 import casadi.casadi as cs
-import numpy as np
-import os
-import traceback
 from collections import Iterable
 
 from utils.config import SolverParams
 
 
-MAX_SOLVER_TIME_MICROS = 8000000#500_000
+MAX_SOLVER_TIME_MICROS = 8_000_000 #500_000
 MAX_OUTER_ITERATIONS = 15
 
 def get_length(iterable):
-    """Simple function to get the length of iterable. Only needed because casadi can't handle len. Super annoying. Why would they do this?
-
+    """Casadi can't handle len.
     Args:
         iterable ([type]): [description]
-
-    Raises:
-        ValueError: [description]
-
     Returns:
         int: length of iterable
     """
@@ -34,7 +31,6 @@ def get_length(iterable):
     except:
         raise ValueError(f"Couldn't calculate length of {iterable}")
 
-
 def rec_positive_check(costs):
     if isinstance(costs, Iterable) and not(type(costs).__module__ == cs.__name__ and  costs.is_constant() and costs.is_scalar()):
         for i in range(get_length(costs)):
@@ -45,7 +41,6 @@ def rec_positive_check(costs):
 
     positive = costs >= 0
     return positive
-
 
 def cost_positive(func):
     """Decorator function that checks if the cost returned is positive.
@@ -70,188 +65,80 @@ def cost_positive(func):
         return cost
     return wrapper
 
+def check_shape(variable_name, requested_shape, var):
+    try:
+        var.shape
+    except:
+        traceback.print_exc()
+        raise Exception(f"{variable_name} must have .shape property.")
+
+    # Special case for 1-D arrays
+    if len(var.shape) == 1:
+        return
+
+    assert var.shape == requested_shape, f"Wrong shape. {variable_name} must have shape: {requested_shape}. It had shape: {var.shape}."
 
 
 class MpcModule:
     def __init__(self, solver_param:SolverParams):
+        self.print_name = "[MPC-Generator]"
         self.obstacles = []                     # list of obstacles
         self.solver_param = solver_param
-        self.print_name = "[MPC-Generator]"
+        self.ts = self.solver_param.base.ts
     
-    def cost_fn(self, state_curr, state_ref, q_pos, q_theta):
-        dx = (state_curr[0] - state_ref[0])**2
-        dy = (state_curr[1] - state_ref[1])**2
-        dtheta = (state_curr[2] - state_ref[2])**2
-        cost = q_pos*(dx + dy) + q_theta*dtheta
-        print("This is not used. Delete this") # TODO: If this is never printed delte this function
-        return cost
-    
-    def dynamics_ct(self, _x, _u):
-        x = (_u[0]*cs.cos(_x[2]))
-        y = (_u[0]*cs.sin(_x[2]))
-        theta = _u[1]
-        return cs.vertcat(x, y, theta)
-    
-    def dynamics_rk4(self, _x, _u):
-        ts = self.solver_param.base.ts
-        f = self.dynamics_ct(_x, _u)
-        k1 = ts*f
-        f = self.dynamics_ct(_x + 0.5*k1, _u)
-        k2 = ts*f
-        f = self.dynamics_ct(_x + 0.5*k2, _u)
-        k3 = ts*f
-        f = self.dynamics_ct(_x + k3, _u)
-        k4 = ts * f
-
-        x_next = _x + (1/6) * (k1 + 2*k2 + 2*k3 + k4)
+    # motion model (discretized via Runge-Kutta)
+    def dynamics_ct(self, x, u): # δ(state) per ts
+        dx = self.ts * (u[0]*cs.cos(x[2]))
+        dy = self.ts * (u[0]*cs.sin(x[2]))
+        dtheta = self.ts * u[1]
+        return cs.vertcat(dx, dy, dtheta)
+    def dynamics_rk1(self, x, u): # discretized via Runge-Kutta 1 (Euler method)
+        return x + self.dynamics_ct(x, u)
+    def dynamics_rk4(self, x, u): # discretized via Runge-Kutta 4
+        k1 = self.dynamics_ct(x, u)
+        k2 = self.dynamics_ct(x + 0.5*k1, u)
+        k3 = self.dynamics_ct(x + 0.5*k2, u)
+        k4 = self.dynamics_ct(x + k3, u)
+        x_next = x + (1/6) * (k1 + 2*k2 + 2*k3 + k4)
         return x_next
-    
-    def dynamics_rk1(self, _x, _u):
-        x_next = self.solver_param.base.ts * self.dynamics_ct(_x, _u)
-        return _x + x_next
-
-    def dynamics_rk4_dual(self, _x, _u):
-        x_master = _x[0:3]
-        x_slave  = _x[3:]
-
-        u_master = _u[0:2]
-        u_slave  = _u[2:] 
+    def dynamics_rk4_dual(self, x, u):
+        x_master = x[0:3]
+        x_slave  = x[3:]
+        u_master = u[0:2]
+        u_slave  = u[2:] 
 
         x_next_master = self.dynamics_rk4(x_master, u_master)
-        x_next_slave = self.dynamics_rk4(x_slave, u_slave)
-        # x_next_master = self.dynamics_rk1(x_master, u_master)
-        # x_next_slave = self.dynamics_rk1(x_slave, u_slave)
+        x_next_slave  = self.dynamics_rk4(x_slave, u_slave)
         return cs.vertcat(x_next_master, x_next_slave)
 
-    def inside_static_triangle(self, x, y, a0s, a1s, bs):
-        crash = 0
-        for i in range(0, self.solver_param.base.n_obs_of_each_vertices - self.solver_param.base.n_param_line, self.solver_param.base.n_param_line):
-            inside = 1
-            for j in range(3):
-                b = bs[i + j]
-                a0 = a0s[i + j]
-                a1 = a1s[i + j]
-                tmp = cs.fmax(0.0, b - a0*x - a1*y)**2.0
-                inside *= tmp
-            
-            crash += inside
-
-        return crash
-    
-    def inside_static_object(self, x, y, a0s, a1s, bs):
-        crash = 0
-
-        base_vert_obj = 0 
-        for vert in range(self.solver_param.base.min_vertices, self.solver_param.base.max_vertices + 1):                
-            for obs in range(0, self.solver_param.base.n_obs_of_each_vertices):
-                inside = 1
-                for line in range(vert):
-                    b  =  bs[base_vert_obj + line + obs * vert] 
-                    a0 = a0s[base_vert_obj + line + obs * vert]
-                    a1 = a1s[base_vert_obj + line + obs * vert]
-                    obs_eq = b - a0*x - a1*y
-                    #h = (cs.fmax(0.0, obs_eq )/obs_eq)**2.0
-                    h = cs.fmax(0.0, obs_eq )**2.0
-                    # TODO : eval this
-                    #h = cs.fmax(h/h, 0)
-                    inside = inside *h
-                # If all equations for each object is > 0, then inside is > 0 
-                crash += inside
-            #Set new index for next object shape
-            base_vert_obj += vert * self.solver_param.base.n_obs_of_each_vertices
-
-        return crash
-    
-    def inside_dyn_ellipse(self, x, y, a0_t, a1_t, a2_t, a3_t, c0_t, c1_t):
-        crash = 0
-        for obs in range(0, self.solver_param.base.n_dyn_obs):
-            inside = 1 
-            z = cs.vertcat(x, y)
-            c = cs.vertcat(c0_t[obs], c1_t[obs])
-            E = cs.SX(2, 2) # a sparse 2-by-2 empty matrix with all zeros
-            E[0, 0]=a0_t[obs]
-            E[0, 1]=a1_t[obs]
-            E[1, 0]=a2_t[obs]
-            E[1, 1]=a3_t[obs]
-
-            crash += cs.fmax(0.0, cs.mtimes(cs.mtimes((z-c).T, E), z-c))**2
-        return crash
-    
+    # obstacle scan
     def inside_dyn_ellipse2(self, x, y, a0_t, a1_t, a2_t, a3_t, c0_t, c1_t, active_obs):
+        #1 - (a1*(c0-x) + a3*(c1-y)) * (c1-y) - (a0*(c0-x) + a2*(c1-y)) * (c0-x)
         crash = 0 
-        #1 - (a1*(c0 - x) + a3*(c1 - y))*(c1 - y) - (a0*(c0 - x) + a2*(c1 - y))*(c0 - x)
-
         for obs in range(0, self.solver_param.base.n_dyn_obs):
             ellips_eq = 1 - (a1_t[obs]*(c0_t[obs] - x) + a3_t[obs]*(c1_t[obs] - y))*(c1_t[obs] - y) - (a0_t[obs]*(c0_t[obs] - x) + a2_t[obs]*(c1_t[obs] - y))*(c0_t[obs] - x)
             crash += cs.fmax(0.0, active_obs[obs]*ellips_eq)**2
         return crash
 
-    def dist2ref(self, x, y, ref_x, ref_y, ref_th):
-
-        p = cs.vertcat(x, y)
-        # Initialize list with CTE to all line segments
-        # https://math.stackexchange.com/questions/330269/the-distance-from-a-point-to-a-line-segment
-        distances = cs.SX.ones(1)
-        s2 = cs.vertcat(ref_x[0], ref_y[0])
-        for i in range(1, self.solver_param.base.n_hor):
-            # set start point as previous end point
-            s1 = s2
-            # new end point
-            s2 = cs.vertcat(ref_x[i], ref_y[i])
-            # line segment
-            s2s1 = s2-s1
-            # t_hat
-            t_hat = cs.dot(p-s1, s2s1)/(s2s1[0]**2+s2s1[1]**2+1e-8) # eval this 
-            # limit t
-            t_star = cs.fmin(cs.fmax(t_hat, 0.0), 1.0)
-            # vector pointing from us to closest point
-            temp_vec = s1 + t_star*s2s1 - p
-            # append distance (is actually squared distance)
-            distances = cs.horzcat(distances, temp_vec[0]**2+temp_vec[1]**2)
-            # TODO : check this
-        
-        return cs.mmin(distances[1:])
-
+    # cost term: cross-track-error
     def dist_to_line(self, pos, l1, l2):
         # line segment
-        s2s1 = l2-l1
+        line = l2-l1
         # t_hat
-        #safe_denom = cs.fmax(s2s1[0]**2+s2s1[1]**2, 1e-8)
-        #t_hat = cs.dot(pos-l1, s2s1)/(safe_denom) # eval this 
-        t_hat = cs.dot(pos-l1, s2s1)/(s2s1[0]**2+s2s1[1]**2+1e-16)
+        t_hat = cs.dot(pos-l1, line)/(line[0]**2+line[1]**2+1e-16)
         # limit t
         t_star = cs.fmin(cs.fmax(t_hat, 0.0), 1.0)
         # vector pointing from us to closest point
-        temp_vec = l1 + t_star*s2s1 - pos
+        temp_vec = l1 + t_star*line - pos
         # append distance (is actually squared distance)
-        min_distance = temp_vec[0]**2+temp_vec[1]**2
-
-        return min_distance
+        squared_distance = temp_vec[0]**2+temp_vec[1]**2
+        return squared_distance
 
     def get_closest_line(self, pos, lines_x, lines_y):
         try:
             lines_x.shape
         except:
-            raise Exception("lines_x must have attribute shape. I.e. you must be able to write: lines_x.shape.")
-
-        # # Initialize list with CTE to all line segments
-        # # https://math.stackexchange.com/questions/330269/the-distance-from-a-point-to-a-line-segment
-        # s2 = cs.vertcat(lines_x[0], lines_y[0])
-        # closest_line = cs.vertcat(s2, s2)
-        # closest_line_dist = 10**9
-
-        # #for i in range(1, self.solver_param.base.n_hor):
-        # for i in range(1, lines_x.shape[0]):
-        #     # set start point as previous end point
-        #     s1 = s2
-        #     # new end point
-        #     s2 = cs.vertcat(lines_x[i], lines_y[i])
-        #     shortest_dist_to_line = self.dist_to_line(pos, s1, s2)
-
-        #     closest_line = cs.if_else(shortest_dist_to_line < closest_line_dist, cs.vertcat(s1, s2), closest_line)
-        #     closest_line_dist = self.dist_to_line(pos, closest_line[:2], closest_line[2:])
-        
-        # return closest_line, closest_line_dist
+            raise Exception("lines_x must have attribute shape (lines_x.shape).")
 
         distances = cs.SX.ones(1)
         s2 = cs.vertcat(lines_x[0], lines_y[0])
@@ -260,17 +147,9 @@ class MpcModule:
             s1 = s2
             # new end point
             s2 = cs.vertcat(lines_x[i], lines_y[i])
-            # line segment
-            s2s1 = s2-s1
-            # t_hat
-            t_hat = cs.dot(pos-s1,s2s1)/(s2s1[0]**2+s2s1[1]**2+1e-16)
-            # limit t
-            t_star = cs.fmin(cs.fmax(t_hat,0.0),1.0)
-            # vector pointing from us to closest point
-            temp_vec = s1 + t_star*s2s1 - pos
-            # append distance (is actually squared distance)
-            distances = cs.horzcat(distances,temp_vec[0]**2+temp_vec[1]**2)
 
+            squared_distance = self.dist_to_line(pos, s1, s2)
+            distances = cs.horzcat(distances, squared_distance)
         return cs.mmin(distances[1:])
 
     @cost_positive
@@ -291,14 +170,11 @@ class MpcModule:
                 tot_cost += (self.theta_ref_master - th_all[t])**2*q_th
             else:
                 tot_cost.append((self.theta_ref_master - th_all[t])**2*q_th)
-
             # Add cost for deviating from line
             if not individual_costs:
                 tot_cost += closest_line_dist*q_dist
             else:
                 tot_cost[-1] += closest_line_dist*q_dist
-
-        #tot_cost += (ref_angle-th_all[t])**2*1
         return tot_cost
     
     @cost_positive
@@ -342,22 +218,9 @@ class MpcModule:
         return cost
 
     @cost_positive
-    def cost_dist2ref_point(self, x_all, y_all, x_ref, y_ref, q_pos):
-        print(" SHOULD NEVER BE USED")
-        assert 1 == 0
-        tot_cost = 0 
-        for t in range(0, self.solver_param.base.n_hor):
-            x = x_all[t]
-            y = y_all[t]
-
-            tot_cost += q_pos*((x-x_ref)**2 + (y-y_ref)**2) #+ q_theta_N*(theta_master-theta_ref_master)**2
-        #cost += q_pos*((x-x_ref)**2 + (y_slave-y_ref_slave)**2) #+ q_theta_N*(theta_slave-theta_ref_slave)**2
-        return tot_cost
-
-    @cost_positive
     def cost_dist2ref_points(self, x_all, y_all, th_all, x_refs, y_refs, th_refs, q_pos, q_theta, individual_costs=False):
-        self.check_shape("all_x", (self.solver_param.base.n_hor,1), x_all)
-        self.check_shape("x_refs", (self.solver_param.base.n_hor,1), x_refs)
+        check_shape("all_x", (self.solver_param.base.n_hor,1), x_all)
+        check_shape("x_refs", (self.solver_param.base.n_hor,1), x_refs)
         
         if not individual_costs:
             tot_cost = 0
@@ -375,44 +238,38 @@ class MpcModule:
                 tot_cost.append(q_pos*((x-x_refs[t])**2 + (y-y_refs[t])**2) + q_theta*((theta-th_refs[t])**2))
         return tot_cost
 
-    @cost_positive
-    def cost_dist2ref_point_N(self, x, y, theta, x_ref, y_ref, theta_ref, q_pos_N, q_theta_N):
-        cost = q_pos_N*((x-x_ref)**2 + (y-y_ref)**2) + q_theta_N*(theta - theta_ref)**2
-        return cost
-
+    # cost term: control input
     @cost_positive
     def cost_control(self, u, q_lin_v, q_ang, individual_costs=False):
         lin_v = u[0::2]
         ang_v = u[1::2]
-
         if not individual_costs:
             lin_cost = cs.mtimes(lin_v.T, lin_v)*q_lin_v
             ang_cost = cs.mtimes(ang_v.T, ang_v)*q_ang
         else:
             lin_cost = lin_v**2*q_lin_v
             ang_cost = ang_v**2*q_ang
-            
-
         return lin_cost, ang_cost
 
     def calc_accelerations(self, u, lin_vel_init, ang_vel_init):
         lin_vel = u[0::2]
         ang_vel = u[1::2]
-        
         # Accelerations
         lin_acc= (lin_vel - cs.vertcat(lin_vel_init, lin_vel[0:-1]))/self.solver_param.base.ts
         ang_acc = (ang_vel - cs.vertcat(ang_vel_init, ang_vel[0:-1]))/self.solver_param.base.ts
-
         return lin_acc, ang_acc
-
-    def calc_jerk(self, lin_acc, ang_acc, lin_acc_init, ang_acc_init):
-        lin_jerk = (lin_acc - cs.vertcat(lin_acc_init, lin_acc[0:-1]))/self.solver_param.base.ts
-        ang_jerk = (ang_acc - cs.vertcat(ang_acc_init, ang_acc[0:-1]))/self.solver_param.base.ts
-        
-        return lin_jerk, ang_jerk
+    
+    @cost_positive
+    def cost_angular_acc(self, acc_list, q_acc, individual_costs=False):      
+        if not individual_costs:
+            cost = cs.mtimes(acc_list.T, acc_list)*q_acc
+        else:
+            cost = acc_list**2*q_acc
+        return cost
 
     @cost_positive
-    def cost_acc_and_retardation(self, acc_list, q_acc, q_ret, individual_costs=False):            
+    def cost_linear_acc(self, acc_list, q_acc, q_ret, individual_costs=False):   
+        # forward acceleration and retarding acceleration are differently weighted (allow emergency stop)         
         acc_up = cs.fmax(0, acc_list)
         acc_down = cs.fmin(0,acc_list)
 
@@ -423,37 +280,7 @@ class MpcModule:
             cost = acc_up**2*q_acc
             cost += acc_down**2*q_ret
             
-
         return cost
-
-    @cost_positive
-    def cost_acc(self, acc_list, q_acc, individual_costs=False):      
-        if not individual_costs:
-            cost = cs.mtimes(acc_list.T, acc_list)*q_acc
-        else:
-            cost = acc_list**2*q_acc
-        return cost
-
-    @cost_positive
-    def cost_acc_constraint(self, acc, acc_min, acc_max, q, individual_costs=False):         
-        self.check_shape("acc", (self.solver_param.base.n_hor, 1), acc)
-
-        if not individual_costs:
-            cost = cs.sum1(cs.fmax(0, acc - acc_max))*q
-            cost += cs.sum1(cs.fmax(0, -acc + acc_min))*q
-        else:
-            cost = cs.fmax(0, acc - acc_max)*q
-            cost += cs.fmax(0, -acc + acc_min)*q
-
-        return cost
-
-    @cost_positive
-    def cost_jerk(self, jerk_list, q, individual_costs=False):         
-        if not individual_costs:
-            return cs.mtimes(jerk_list.T, jerk_list)*q
-        else:
-            return jerk_list**2*q
-
 
     @cost_positive
     def cost_inside_static_object(self, x_all, y_all, q, individual_costs=False):         
@@ -462,7 +289,6 @@ class MpcModule:
         else:
             crash_in_trajectory = [] 
         
-
         for t in range(0, self.solver_param.base.n_hor):
             crash = 0
             x = x_all[t]
@@ -478,8 +304,6 @@ class MpcModule:
                         obs_eq = b - a0*x - a1*y
                         #h = (cs.fmax(0.0, obs_eq )/obs_eq)**2.0
                         h = cs.fmax(0.0, obs_eq )**2.0
-                        # TODO : eval this
-                        #h = cs.fmax(h/h, 0)
                         inside = inside *h
                     # If all equations for each object is > 0, then inside is > 0 
                     crash += inside
@@ -495,7 +319,7 @@ class MpcModule:
 
     @cost_positive
     def cost_inside_dyn_ellipse2(self, x_all, y_all, q, individual_costs=False):
-        #1 - (a1*(c0 - x) + a3*(c1 - y))*(c1 - y) - (a0*(c0 - x) + a2*(c1 - y))*(c0 - x)
+        #1 - (a1*(c0-x) + a3*(c1-y)) * (c1-y) - (a0*(c0-x) + a2*(c1-y)) * (c0-x)
         if not individual_costs:
             crash_in_trajectory = 0 
         else:
@@ -524,19 +348,6 @@ class MpcModule:
 
         return crash_in_trajectory
 
-    def print_ellipse(self):
-            # Dynamic ellipse parameters for timestep t
-        for t in range(0, self.solver_param.base.n_hor):
-            a0_t = self.a0_dyn[t :: self.solver_param.base.n_hor]
-            a1_t = self.a1_dyn[t :: self.solver_param.base.n_hor]
-            a2_t = self.a2_dyn[t :: self.solver_param.base.n_hor]
-            a3_t = self.a3_dyn[t :: self.solver_param.base.n_hor]
-            c0_t = self.c0_dyn[t :: self.solver_param.base.n_hor]
-            c1_t = self.c1_dyn[t :: self.solver_param.base.n_hor]
-            for obs in range(0, self.solver_param.base.n_dyn_obs):
-                print(f"1 - ({a1_t[obs]}*({c0_t[obs]} - x) + {a3_t[obs]}*({c1_t[obs]} - y))*({c1_t[obs]} - y) - ({a0_t[obs]}*({c0_t[obs]} - x) + {a2_t[obs]}*({c1_t[obs]} - y))*({c0_t[obs]} - x)")
-                #crash += cs.fmax(0.0, self.active_dyn_obs[obs]*ellips_eq)**2
-
     @cost_positive
     def cost_inside_future_dyn_ellipse(self, x_all, y_all, q):
         print("This should never be used") #TODO: Delete this if it's never used
@@ -562,8 +373,8 @@ class MpcModule:
         return crash_in_trajectory*q
     
     def cost_v_ref_difference(self, all_u, v_ref, q_upper, q_lower, individual_costs=False):
-        self.check_shape("all_u", (2*self.solver_param.base.n_hor, 1), all_u)
-        self.check_shape("v_ref", (self.solver_param.base.n_hor, 1), v_ref)
+        check_shape("all_u", (2*self.solver_param.base.n_hor, 1), all_u)
+        check_shape("v_ref", (self.solver_param.base.n_hor, 1), v_ref)
 
         all_v = all_u[0::2]
         diff = all_v-v_ref
@@ -575,8 +386,7 @@ class MpcModule:
             cost += cs.mtimes(v_lower.T, v_lower)*q_lower 
         else:
             cost = v_upper**2*q_upper 
-            cost += v_lower**2*q_lower #TODO Makse sure they're added and not appended
-
+            cost += v_lower**2*q_lower #TODO Make sure they're added and not appended
 
         return cost
 
@@ -591,32 +401,18 @@ class MpcModule:
 
         return cost
 
-    def formation_angle2(self, x_m, y_m, x_s, y_s, s0, s1):
-        p_m = cs.vertcat(x_m,y_m)
-        p_s = cs.vertcat(x_s,y_s)
-
-        ref_vec = s1 -s0
-        formation_vec = p_m - p_s
-        safe_denom = cs.fmax(cs.norm_2(ref_vec)*cs.norm_2(formation_vec), 0.0001) 
-        cos_angle = cs.dot(ref_vec,formation_vec) / (safe_denom)
-        #cos_angle = cs.dot(ref_vec,formation_vec) / (cs.norm_2(ref_vec)*cs.norm_2(formation_vec))
-        angle = cs.acos(cos_angle)
-
-        return angle
-
-    def angle_between_2_lines(self, l1, l2, epsilon=1e-10, signed=True, normalized=False):
+    def angle_between_2_lines(self, l1, l2, normalized=False):
         """Calculates the angle between two lines
 
         Args:
             l1 (np.array): array of the 2 positions which make up the first line. [[x0 x1], [y0 y1]]
             l2 ([type]): [description]
-            epsilon ([type], optional): [description]. Defaults to 1e-3.
-
         Returns:
             [type]: [description]
         """
-        self.check_shape("l1", (2,2), l1)
-        self.check_shape("l2", (2,2), l2)
+        check_shape("l1", (2,2), l1)
+        check_shape("l2", (2,2), l2)
+        epsilon = 1e-10
 
         l1_vec = l1[:,1] - l1[:,0]
         l2_vec = l2[:,1] - l2[:,0]
@@ -629,9 +425,8 @@ class MpcModule:
             cos_angle = cs.fmax(cos_angle, -1.0+epsilon)
         angle = cs.acos(cos_angle)
 
-        if signed:
-            sign = cs.sign(l2_vec[0]*l1_vec[1] - l2_vec[1]*l1_vec[0])
-            angle*=sign
+        sign = cs.sign(l2_vec[0]*l1_vec[1] - l2_vec[1]*l1_vec[0])
+        angle *= sign
 
         return angle
 
@@ -644,27 +439,12 @@ class MpcModule:
         wanted_line = cs.horzcat(cs.vertcat(0.0,0.0), cs.vertcat(cs.cos(angle_ref), cs.sin(angle_ref))) #TODO: Maybe pass this as a parameter instead of angle_ref
         
         angle_error = self.angle_between_2_lines(wanted_line, master_slave_line, normalized=False)
-
         return angle_error 
-
-    def check_shape(self, variable_name, requested_shape, var):
-        # Make sure they have .shape
-        try:
-            var.shape
-        except:
-            traceback.print_exc()
-            raise Exception(f"{variable_name} must have .shape property.")
-
-        # Special case for 1-D arrays
-        if len(var.shape) == 1:
-            return
-
-        assert var.shape == requested_shape, f"Wrong shape. {variable_name} must have shape: {requested_shape}. It had shape: {var.shape}."
 
     @cost_positive
     def cost_formation(self, x_m, y_m, x_s, y_s, ref_angle, q, individual_costs=False):
-        self.check_shape("X_m", cs.vertcat(-1,1), x_m)
-        self.check_shape("Y_m", cs.vertcat(-1,1), y_m)
+        check_shape("X_m", cs.vertcat(-1,1), x_m)
+        check_shape("Y_m", cs.vertcat(-1,1), y_m)
         
         if not individual_costs:
             cost = 0
@@ -676,24 +456,8 @@ class MpcModule:
                 cost += q * self.calc_formation_angle_error(x_m[t], y_m[t], x_s[t], y_s[t], ref_angle)**2
             else:
                 cost.append(q * self.calc_formation_angle_error(x_m[t], y_m[t], x_s[t], y_s[t], ref_angle)**2)
-
         return cost
     
-    @cost_positive
-    def cost_reverse(self, v, q, individual_costs=False):
-        if not individual_costs:
-            cost = 0
-        else:
-            cost = []
-        for t in range(self.solver_param.base.n_hor):
-            neg_vel = cs.fmin(0,v[t])
-            if not individual_costs:
-                cost += neg_vel**2* q
-            else:
-                cost.append(neg_vel**2* q)
-
-        return cost 
-
     def outside_bounds(self, x, y, a0 , a1, b):
         outside = 0 
         for i in range(self.solver_param.base.n_bounds_vertices):
@@ -760,6 +524,7 @@ class MpcModule:
         
         return master_theta_ref
 
+    # constraints
     def acc_lagrangian_constraints(self, lin_acc_master, ang_acc_master, lin_acc_slave, ang_acc_slave):
         f = cs.vertcat(lin_acc_master, ang_acc_master, lin_acc_slave, ang_acc_slave)
         amin = [self.solver_param.base.lin_acc_min, -self.solver_param.base.ang_acc_max]*self.solver_param.base.n_hor * 2
@@ -776,25 +541,20 @@ class MpcModule:
             x_s = x_slave[t]
             y_s = y_slave[t]
             dist_lb = (-((x_m-x_s)**2 + (y_m-y_s)**2) + self.d_lb**2 ) *self.enable_distance_constraint
-            #dist_ub = ((x_m-x_s)**2 + (y_m-y_s)**2)*self.enable_distance_constraint + (1-self.enable_distance_constraint)*1 #TODO Rename enable_distance_constraint
             dist_ub = (((x_m-x_s)**2 + (y_m-y_s)**2) - self.d_ub**2 ) *self.enable_distance_constraint #TODO Rename enable_distance_constraint
             f = cs.vertcat(f, dist_lb, dist_ub)
 
-        # dist_min = [(self.d+self.d_tol_lb)**2] * self.solver_param.base.n_hor
-        # dist_max = [(self.d+self.d_tol_ub)**2] * self.solver_param.base.n_hor
-        #dist_min = [(self.solver_param.base.constraint['distance_lb'])**2] * self.solver_param.base.n_hor # Casadi cannot use parameters as Rectangle constraints / bounds
         dist_min = [-cs.inf] * 2 *self.solver_param.base.n_hor # Casadi cannot use parameters as Rectangle constraints / bounds
         dist_max = [0] * 2 * self.solver_param.base.n_hor
         c = og.constraints.Rectangle(dist_min, dist_max)
         return f, c
 
     def store_params(self, parameters=None):
-        """Stores all the parameters required for both building the solver and calculating all 
-        the various costs, states, velocites etc. Z0 can either be None or a list of all the 
-        required params. If it's None Z0 will the set to a casadi symbolic lists. This is for 
-        building the solver.
+        """Stores all the parameters required for building the solver and calculating all 
+        the costs, states, velocites etc. Z0 can either be None or a list of all the required 
+        params. If it's None Z0 is set to a casadi symbolic lists, for building the solver.
         Args:
-            self.parameters ([type], optional): [description]. Defaults to None.
+            self.parameters ([type], optional): [description]. 
         """
 
         # Build parametric optimizer
@@ -914,14 +674,10 @@ class MpcModule:
         cost += self.cost_outside_bounds(all_x_master[1:], all_y_master[1:], self.q_obs_c)
         cost += self.cost_outside_bounds(all_x_slave[1:], all_y_slave[1:], self.q_obs_c)
         # Cost for ideal states
-        # cost += self.cost_dist2ref_point(all_x_master, all_y_master, self.x_ref_master, self.y_ref_master, self.q_pos)
-        # cost += self.cost_dist2ref_point(all_x_slave, all_y_slave, self.x_ref_slave, self.y_ref_slave, self.q_pos)
         cost += self.cost_dist2ref_points(all_x_master[1:], all_y_master[1:], all_th_master[1:],  self.ref_points_master_x, self.ref_points_master_y, self.ref_points_master_th, self.q_pos_master, self.q_theta_master)
         cost += self.cost_dist2ref_points(all_x_slave[1:] , all_y_slave[1:] , all_th_slave[1:] ,  self.ref_points_slave_x , self.ref_points_slave_y , self.ref_points_slave_th , self.q_pos_slave , self.q_theta_slave)
         # cost += self.cost_formation(all_x_master, all_y_master, all_x_slave, all_y_slave, self.formation_angle, self.q_formation_ang)
-        # Last point weigt
-        cost += self.cost_dist2ref_point_N(all_x_master[-1], all_y_master[-1], all_th_master[-1], self.ref_points_master_x[-1], self.ref_points_master_y[-1], self.ref_points_master_th[-1], self.q_pos_N, self.q_theta_N)
-        cost += self.cost_dist2ref_point_N(all_x_slave[-1], all_y_slave[-1], all_th_slave[-1], self.ref_points_slave_x[-1], self.ref_points_slave_y[-1], self.ref_points_slave_th[-1], self.q_pos_N, self.q_theta_N)
+        # Last point weigt (ignored for now)
         ##################
         cost += self.cost_dist2ref_line(all_x_master[1:], all_y_master[1:], all_th_master[1:], self.ref_points_master_x, self.ref_points_master_y, self.q_cte, self.q_line_theta)
         # cost += self.cost_dist2ref_line(all_x_slave, all_y_slave, all_th_slave, self.ref_points_slave_x, self.ref_points_slave_y, self.q_cte*self.enable_distance_constraint, self.q_theta*self.enable_distance_constraint*0)
@@ -952,40 +708,14 @@ class MpcModule:
         # Cost for reference velocity
         cost += self.cost_v_ref_difference(master_u, self.v_ref_master, self.q_d_lin_vel_upper, self.q_d_lin_vel_lower )
         cost += self.cost_ang_vel_ref_difference(master_u, self.ang_vel_ref_master, self.q_d_ang_vel)
-        #cost += self.cost_v_ref_difference(slave_u, self.v_ref_slave, self.q_du*self.enable_distance_constraint)
-        cost += self.cost_reverse(slave_u[0::2],self.q_reverse) 
         # Accelerations cost
         lin_acc_master, ang_acc_master = self.calc_accelerations(master_u, self.vel_init, self.ang_init)
-        cost += self.cost_acc_and_retardation(lin_acc_master, self.q_lin_acc, self.q_lin_ret)
-        cost += self.cost_acc(ang_acc_master, self.q_ang_acc)
+        cost += self.cost_linear_acc(lin_acc_master, self.q_lin_acc, self.q_lin_ret)
+        cost += self.cost_angular_acc(ang_acc_master, self.q_ang_acc)
 
         lin_acc_slave, ang_acc_slave = self.calc_accelerations(slave_u, self.vel_init_slave, self.ang_init_slave)
-        cost += self.cost_acc_and_retardation(lin_acc_slave, self.q_lin_acc, self.q_lin_ret)
-        cost += self.cost_acc(ang_acc_slave, self.q_ang_acc)
-
-        # Acceleration constraints 
-        #cost += self.cost_acc_constraint(lin_acc_master, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.q_acc_c)
-        #cost += self.cost_acc_constraint(lin_acc_slave, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, self.q_acc_c)
-        #cost += self.cost_acc_constraint(ang_acc_master, -self.solver_param.base.ang_acc_max, self.solver_param.base.ang_acc_max, self.q_acc_c)
-        #cost += self.cost_acc_constraint(ang_acc_slave, -self.solver_param.base.ang_acc_max, self.solver_param.base.ang_acc_max, self.q_acc_c)
-        # penalty_c += self.cost_acc_constraint(lin_acc_master, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, 1)
-        # penalty_c += self.cost_acc_constraint(lin_acc_slave, self.solver_param.base.lin_acc_min, self.solver_param.base.lin_acc_max, 1)
-        # penalty_c += self.cost_acc_constraint(ang_acc_master, -self.solver_param.base.ang_acc_max, self.solver_param.base.ang_acc_max, 1)
-        # penalty_c += self.cost_acc_constraint(ang_acc_slave, -self.solver_param.base.ang_acc_max, self.solver_param.base.ang_acc_max, 1)
-        # f1_, c1_ = self.acc_lagrangian_constraints(lin_acc_master, ang_acc_master, lin_acc_slave, ang_acc_slave)
-        # f1 = cs.vertcat(f1, f1_)
-        # c1 = og.constraints.Rectangle(c1.xmin+c1_.xmin, c1.xmax+c1_.xmax)
-        
-        
-
-        # Jerk costs
-        master_lin_jerk, master_ang_jerk = self.calc_jerk(lin_acc_master, ang_acc_master, self.lin_acc_init_master, self.ang_acc_init_master)
-        cost += self.cost_jerk(master_lin_jerk, self.q_lin_jerk)
-        cost += self.cost_jerk(master_ang_jerk, self.q_ang_jerk)
-
-        slave_lin_jerk, slave_ang_jerk = self.calc_jerk(lin_acc_slave, ang_acc_slave, self.lin_acc_init_slave, self.ang_acc_init_slave)
-        cost += self.cost_jerk(slave_lin_jerk, self.q_lin_jerk)
-        cost += self.cost_jerk(slave_ang_jerk, self.q_ang_jerk)
+        cost += self.cost_linear_acc(lin_acc_slave, self.q_lin_acc, self.q_lin_ret)
+        cost += self.cost_angular_acc(ang_acc_slave, self.q_ang_acc)
 
         problem = og.builder.Problem(u, self.parameters, cost)
         problem.with_constraints(bounds)
@@ -1011,8 +741,7 @@ class MpcModule:
         builder = og.builder.OpEnOptimizerBuilder(problem, 
                                                 meta, 
                                                 build_config, 
-                                                solver_config) \
-            .with_verbosity_level(1)
+                                                solver_config).with_verbosity_level(1)
         builder.build()
 
 
@@ -1030,7 +759,7 @@ if __name__ == "__main__":
     mpc_generator = MpcModule(solver_param.base)
     x_m = np.array([0]*solver_param.base.n_hor )
     y_m = np.array([1]*solver_param.base.n_hor )
-    th_m =np.array([cs.pi/2] *solver_param.base.n_hor)
+    th_m = np.array([cs.pi/2] *solver_param.base.n_hor)
     x_s = np.array([0]*solver_param.base.n_hor )
     y_s = np.array([1]*solver_param.base.n_hor )
     rx =  np.array([0]*solver_param.base.n_hor )
@@ -1049,8 +778,6 @@ if __name__ == "__main__":
     assert np.all(closest_line == expected_line), f"The closest line should be: {expected_line}, but is: {closest_line}"
     assert closest_line_distance == expected_distance, f"The closest line  distanceshould be: {expected_distance}, but is: {closest_line}"
 
-    
-
     # Test calc master_line_ang
     # Test 1
     xm = np.array([2,2])
@@ -1060,8 +787,6 @@ if __name__ == "__main__":
     expected_angle = -np.pi/4
     angle = mpc_generator.calc_master_slave_ang(xm, xs, cs.arctan2(s1[1] - s0[1], s1[0] - s0[0]))
     assert expected_angle - angle < 1e-3 , f"The returned angle should be {expected_angle} but is: {angle}"
-
-
     # Test 2
     xm = np.array([0,1])
     xs = np.array([0,0])
@@ -1070,7 +795,6 @@ if __name__ == "__main__":
     expected_angle = 0
     angle = mpc_generator.calc_master_slave_ang(xm, xs, cs.arctan2(s1[1] - s0[1], s1[0] - s0[0]))
     assert expected_angle - angle < 1e-3 , f"The returned angle should be {expected_angle} but is: {angle}"
-
     # Test 3
     xm = np.array([0,0])
     xs = np.array([0,1])
@@ -1079,8 +803,6 @@ if __name__ == "__main__":
     expected_angle = np.pi
     angle = mpc_generator.calc_master_slave_ang(xm, xs, cs.arctan2(s1[1] - s0[1], s1[0] - s0[0]))
     assert expected_angle - np.abs(angle) < 1e-3 , f"The returned angle should be {expected_angle} but is: {angle}"
-
-
     # Test 4
     xm = np.array([-1,-2])
     xs = np.array([5,1])
@@ -1088,8 +810,6 @@ if __name__ == "__main__":
     s1 = np.array([-1,-2])
     angle = mpc_generator.calc_master_slave_ang(xm, xs, cs.arctan2(s1[1] - s0[1], s1[0] - s0[0]))
     assert angle < 0 and angle > -np.pi/2
-
-    
 
     # Line right, slave south 
     # -m->
@@ -1103,14 +823,12 @@ if __name__ == "__main__":
     s2 = np.array([2,0])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = -cs.pi/2
-
     assert angle == expected_angle , f"The returned angle should be {expected_angle} but is: {angle}"
 
     # Line up slave notheast
     #   ^
     #   | s
     #   m
-    #  
     x_m = np.array([0])
     y_m = np.array([0])
     x_s = np.array([1])
@@ -1120,16 +838,13 @@ if __name__ == "__main__":
     s2 = np.array([0,2])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = -3*cs.pi/4
-
     assert angle == expected_angle , f"The returned angle should be {expected_angle} but is: {angle}"
     
     # Line up slave up
-    #   ^
-    #   | 
     #   s
+    #   ^
     #   |
     #   m
-    #  
     x_m = np.array([0])
     y_m = np.array([0])
     x_s = np.array([0])
@@ -1139,14 +854,12 @@ if __name__ == "__main__":
     s2 = np.array([0,2])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = cs.pi
-
     assert abs(float(angle)) == expected_angle , f"The returned angle should be {expected_angle} but is: {angle}"
 
     # Line up slave northwest
     #   ^
     #  s| 
     #   m
-    #  
     x_m = np.array([0])
     y_m = np.array([0])
     x_s = np.array([-1])
@@ -1156,7 +869,6 @@ if __name__ == "__main__":
     s2 = np.array([0,2])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = 3*cs.pi/4
-
     assert angle == expected_angle , f"The returned angle should be {expected_angle} but is: {angle}"
 
     # Line up slave northwest
@@ -1173,8 +885,8 @@ if __name__ == "__main__":
     s2 = np.array([0,2])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = cs.pi/4
-
     assert np.abs(angle - expected_angle) < 1e-5  , f"The returned angle should be {expected_angle} but is: {angle}"
+    
     # Line up slave northwest
     #   ^
     #   | 
@@ -1189,17 +901,7 @@ if __name__ == "__main__":
     s2 = np.array([0,2])
     angle = mpc_generator.formation_angle(x_m, y_m, x_s, y_s, s0, s1, s2)
     expected_angle = -cs.pi/4
-
     assert np.abs(angle - expected_angle) < 1e-5, f"The returned angle should be {expected_angle} but is: {angle}"
-
-
-    
-    
-    
-    
-    
-    
-    
     
     # Check if angle punishment works
     mpc_generator.solver_param.base.n_hor = 2
@@ -1221,8 +923,7 @@ if __name__ == "__main__":
     expected_cost = (0)**2*2
     assert cs.fabs(cost) <= expected_cost + 0.0001, f"The returned cost should be {expected_cost} but is: {cost}"
     
-    
- # line up slave to right 
+    # line up slave to right 
     #   ^
     #   |
     # <-m-s
@@ -1234,9 +935,9 @@ if __name__ == "__main__":
     ref_x = np.array([0,0,0])
     ref_y = np.array([0,1,1])
     cost = mpc_generator.cost_formation(x_m,y_m,x_s,y_s,ref_x,ref_y, 1)
-
     expected_cost = (cs.pi/2)**2*2
     assert cost == expected_cost, f"The returned cost should be {expected_cost} but is: {cost}"
+
     # line up slave to right 
     #   ^
     #   |
@@ -1251,12 +952,10 @@ if __name__ == "__main__":
     ref_x = np.array([0,0,0])
     ref_y = np.array([0,1,1])
     cost = mpc_generator.cost_formation(x_m,y_m,x_s,y_s,ref_x,ref_y, 1)
-
     expected_cost = (cs.pi)**2*2
     assert cs.fabs(cost) <= expected_cost + 0.0001, f"The returned cost should be {expected_cost} but is: {cost}"    
     
     # distance soft constraint
-
     all_x_master = np.array([0]*solver_param.base.n_hor) 
     all_y_master = np.array([0,3]*solver_param.base.n_hor) 
     all_x_slave = np.array([0]*solver_param.base.n_hor) 
@@ -1269,10 +968,4 @@ if __name__ == "__main__":
     expected_cost = 0 
     assert cs.fabs(cost) <= expected_cost + 0.00001 and cs.fabs(cost) >= expected_cost -0.00001, f"The returned cost should be {expected_cost} but is: {cost}"
     
-    
-    
-    
     print("mpc_generator passed all tests!")
-        
-
-

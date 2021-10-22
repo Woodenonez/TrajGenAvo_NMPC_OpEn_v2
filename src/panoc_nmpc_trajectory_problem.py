@@ -1,22 +1,18 @@
 # Python imports
-from operator import mod
-from sympy.core.numbers import E
-import numpy as np
-import math
-from time import perf_counter_ns
+import os, sys, math
 import traceback
-import shapely
-from enum import Enum
-from queue import Full
-import pyclipper
-import numpy as np
-from sympy.utilities.iterables import reshape
-import scipy
 from time import perf_counter_ns
+from enum import Enum
+
+import scipy
+import numpy as np
+
+import shapely
 from sympy import symbols, solve, lambdify
-from sympy.testing.pytest import ignore_warnings
+
 # Own imports
 from ATRS import ATRS
+
 
 class States(Enum):
     COUPLING = 0
@@ -40,88 +36,46 @@ class States(Enum):
             traceback.print_exc()
             raise(Exception("This state doesn't exist!"))
 
-
 class PanocNMPCTrajectoryProblem: 
     def __init__(self, solver_param, solver, mpc_generator): 
-        self.id = 0
         self.solver_param = solver_param
-        self.mvee_solutions = None
-        self.solve_mvee()
-        self.initial_guess_pos = None
         self.solver = solver
         self.mpc_generator = mpc_generator
 
+        self.initial_guess_pos = None
 
-    def solve_mvee(self):
-        x = symbols('x')
-        y = symbols('y')
-
-        x0 = symbols('x0')
-        y0 = symbols('y0')
-        a = symbols('a')
-        b = symbols('b')
-        d = symbols('c')
-        e = symbols('d')
-
-        x_bar = x-x0
-        y_bar = y-y0
-        eq = 1 - (x_bar*(a*x_bar+b*y_bar) + y_bar*(d*x_bar+e*y_bar))
-        sol = solve(eq,x)
-
-        syms = [x0, y0, a, b, d, e, y]
-        sol_v1 = sol[0]
-        sol_v2 = sol[1]
-
-        # Create functions to quickly evaluate the equations
-        sol_v1 = lambdify(syms, sol_v1, "numpy")
-        sol_v2 = lambdify(syms, sol_v2, "numpy")
-        self.mvee_solutions = [sol_v1, sol_v2]
-
-    def convert_bounds_to_eqs(self, boundary_padded):
-        bounds = boundary_padded
-        A, B = self.obstacle_as_inequality(np.mat(bounds))
-        bounds_array = np.array(np.concatenate((B, A), axis = 1)).reshape(-1)
-
-        #convert to list
-        bounds_array = list(bounds_array)
-        n_params = len(bounds_array)
-        req_param = self.solver_param.base.n_bounds_vertices*self.solver_param.base.n_param_line
-        if n_params < req_param:
-            extra_params = np.zeros(req_param-n_params)
-            bounds_array = bounds_array + list(extra_params)
-        return bounds_array
-
-    def convert_static_obs_to_eqs(self, closest_obs):
-        """[summary]
-
-        Args:
-            x_cur ([type]): [description]
-        
+    def obstacle_as_inequality(self, Vs):
+        # def vert2con(Vs):
+        '''
+        Compute the H-representation of a set of points (facet enumeration).
+        Arguments:
+            Vs: np.mat(np.array([[x0, y0], [x1, y1], [x2, y2]]))
         Returns:
-            obs_equations (numpy array): 1-d numpy array where the static and unexpected obstacles as [b0 a0^T ... bn an^T]
-        
-        """
-        
-        # Convert the closest static and dynamic obstacles into inequalities 
-        obs_equations = []
-        for key in closest_obs:
-            obs = closest_obs[key]
-            key_obs_equations = np.array(self.obstacles_as_inequalities(obs)).reshape(-1)
+            A   (L x d) array. Each row in A represents hyperplane normal.
+            b   (L x 1) array. Each element in b represents the hyperpalne
+                constant bi
+        Taken from https://github.com/d-ming/AR-tools/blob/master/artools/artools.py
+        '''
+        hull = scipy.spatial.ConvexHull(Vs)
+        K = hull.simplices
+        c = np.mean(Vs[hull.vertices, :], 0)  # c is a (1xd) vector
 
-            # If there aren't enough obstacles, fill with 0s
-            n_obs = len(obs)
-            if n_obs < self.solver_param.base.n_obs_of_each_vertices: #TODO: Add special case for triangles
-                obs_array = np.zeros((self.solver_param.base.n_obs_of_each_vertices-n_obs)*3*key) # CHange 3 to the variable in self.solver_param
-                key_obs_equations = np.hstack((key_obs_equations, obs_array))
-            obs_equations.append(key_obs_equations)
-        
-        obs_equations = np.hstack(obs_equations)
+        # perform affine transformation (subtract c from every row in Vs)
+        V = Vs - c
+        A = scipy.NaN * np.empty((K.shape[0], Vs.shape[1]))
 
-        
-        # Make sure the correct number of params are sent
-        assert( sum(range(self.solver_param.base.min_vertices, self.solver_param.base.max_vertices+1)) *3 * self.solver_param.base.n_obs_of_each_vertices == sum(obs_equations.shape)), "An invalid amount of static obstacles parameters were sent."
+        rc = 0
+        for i in range(K.shape[0]):
+            ks = K[i, :]
+            F = V[ks, :]
+            if np.linalg.matrix_rank(F) == F.shape[0]:
+                f = np.ones(F.shape[0])
+                A[rc, :] = scipy.linalg.solve(F, f)
+                rc += 1
 
-        return obs_equations, closest_obs
+        A = A[0:rc, :]
+        b = np.dot(A, c.T) + 1.0
+        return (A, b)
 
     def obstacles_as_inequalities(self, obstacles):
         """
@@ -135,67 +89,6 @@ class PanocNMPCTrajectoryProblem:
             obs_equations.append(obs_array)
         
         return obs_equations
-    
-    def obstacle_as_inequality(self, Vs):
-        # def vert2con(Vs):
-        '''
-        Compute the H-representation of a set of points (facet enumeration).
-        Arguments:
-            Vs: np.mat(np.array([[x0, y0], [x1, y1], [x2, y2]]))
-        Returns:
-            A   (L x d) array. Each row in A represents hyperplane normal.
-            b   (L x 1) array. Each element in b represents the hyperpalne
-                constant bi
-        Taken from https://github.com/d-ming/AR-tools/blob/master/artools/artools.py
-        '''
-
-
-        hull = scipy.spatial.ConvexHull(Vs)
-        K = hull.simplices
-        c = np.mean(Vs[hull.vertices, :], 0)  # c is a (1xd) vector
-
-        # perform affine transformation (subtract c from every row in Vs)
-        V = Vs - c
-
-        A = scipy.NaN * np.empty((K.shape[0], Vs.shape[1]))
-
-        rc = 0
-        for i in range(K.shape[0]):
-            ks = K[i, :]
-            F = V[ks, :]
-
-            if np.linalg.matrix_rank(F) == F.shape[0]:
-                f = np.ones(F.shape[0])
-                A[rc, :] = scipy.linalg.solve(F, f)
-                rc += 1
-
-        A = A[0:rc, :]
-        b = np.dot(A, c.T) + 1.0
-
-        return (A, b)
-
-
-    def convert_dynamic_obs_to_eqs(self, closest_obs):
-        
-        # Convert them into ellipses
-        obs_ellipse = []
-        for ob in closest_obs:
-            obs_ellipse.append(self.obstacles_as_ellipses([np.array(ob_.exterior.xy).T[:-1] for ob_ in ob]))
-        ellipse_to_plot = obs_ellipse.copy()
-
-
-        # If there aren't enough obstacles, append 0s
-        n_obs = len(obs_ellipse)
-        obs_ellipse = np.array(obs_ellipse).reshape(-1)
-        if n_obs < self.solver_param.base.n_dyn_obs:
-            obs_array = np.zeros((self.solver_param.base.n_dyn_obs - n_obs) * self.solver_param.base.n_param_dyn_obs * self.solver_param.base.n_hor)
-            obs_ellipse = np.hstack((obs_ellipse, obs_array))
-        
-
-        # Make sure the correct amount of parameters are returned
-        assert(self.solver_param.base.n_param_dyn_obs *self.solver_param.base.n_hor*self.solver_param.base.n_dyn_obs == sum(obs_ellipse.shape)), "An invalid amount of dynamic obstacles parameters were sent."
-
-        return obs_ellipse, closest_obs, ellipse_to_plot
 
     def obstacle_as_ellipse(self, obstacle):
         """Converts obstacles into ellipses with representation:  (x-c).T * A * (x-c) = 1.
@@ -248,8 +141,68 @@ class PanocNMPCTrajectoryProblem:
         for ob in obstacles:
             A, c = self.obstacle_as_ellipse(ob)
             obs.append(np.concatenate((np.reshape(A, -1), c)))
-        
         return obs
+
+    def convert_bounds_to_eqs(self, boundary_padded):
+        bounds = boundary_padded
+        A, B = self.obstacle_as_inequality(np.mat(bounds))
+        bounds_array = np.array(np.concatenate((B, A), axis = 1)).reshape(-1)
+        #convert to list
+        bounds_array = list(bounds_array)
+        n_params = len(bounds_array)
+        req_param = self.solver_param.base.n_bounds_vertices*self.solver_param.base.n_param_line
+        if n_params < req_param:
+            extra_params = np.zeros(req_param-n_params)
+            bounds_array = bounds_array + list(extra_params)
+        return bounds_array
+
+    def convert_static_obs_to_eqs(self, closest_obs):
+        """[summary]
+
+        Args:
+            x_cur ([type]): [description]
+        
+        Returns:
+            obs_equations (numpy array): 1-d numpy array where the static and unexpected obstacles as [b0 a0^T ... bn an^T]
+        
+        """
+        # Convert the closest static and dynamic obstacles into inequalities 
+        obs_equations = []
+        for key in closest_obs:
+            obs = closest_obs[key]
+            key_obs_equations = np.array(self.obstacles_as_inequalities(obs)).reshape(-1)
+
+            # If there aren't enough obstacles, fill with 0s
+            n_obs = len(obs)
+            if n_obs < self.solver_param.base.n_obs_of_each_vertices: #TODO: Add special case for triangles
+                obs_array = np.zeros((self.solver_param.base.n_obs_of_each_vertices-n_obs)*3*key) # CHange 3 to the variable in self.solver_param
+                key_obs_equations = np.hstack((key_obs_equations, obs_array))
+            obs_equations.append(key_obs_equations)
+        
+        obs_equations = np.hstack(obs_equations)
+
+        # Make sure the correct number of params are sent
+        assert( sum(range(self.solver_param.base.min_vertices, self.solver_param.base.max_vertices+1)) *3 * self.solver_param.base.n_obs_of_each_vertices == sum(obs_equations.shape)), "An invalid amount of static obstacles parameters were sent."
+        return obs_equations, closest_obs
+
+    def convert_dynamic_obs_to_eqs(self, closest_obs):
+        # Convert them into ellipses
+        obs_ellipse = []
+        for ob in closest_obs:
+            obs_ellipse.append(self.obstacles_as_ellipses([np.array(ob_.exterior.xy).T[:-1] for ob_ in ob]))
+        ellipse_to_plot = obs_ellipse.copy()
+
+        # If there aren't enough obstacles, append 0s
+        n_obs = len(obs_ellipse)
+        obs_ellipse = np.array(obs_ellipse).reshape(-1)
+        if n_obs < self.solver_param.base.n_dyn_obs:
+            obs_array = np.zeros((self.solver_param.base.n_dyn_obs - n_obs) * self.solver_param.base.n_param_dyn_obs * self.solver_param.base.n_hor)
+            obs_ellipse = np.hstack((obs_ellipse, obs_array))
+    
+        # Make sure the correct amount of parameters are returned
+        assert(self.solver_param.base.n_param_dyn_obs *self.solver_param.base.n_hor*self.solver_param.base.n_dyn_obs == sum(obs_ellipse.shape)), "An invalid amount of dynamic obstacles parameters were sent."
+        return obs_ellipse, closest_obs, ellipse_to_plot
+
 
     def get_active_dyn_obs(self, dyn_constraints):
         dyn_constraints_len = len(dyn_constraints)
@@ -274,48 +227,6 @@ class PanocNMPCTrajectoryProblem:
                     active_obs[obs] = 0
         
         return active_obs
-
-    def create_circle_sector(self, center, start_angle, end_angle, radius, steps=200):
-        """Taken from https://stackoverflow.com/questions/54284984/sectors-representing-and-intersections-in-shapely
-
-        Args:
-            center ([type]): [description]
-            start_angle ([type]): [description]
-            end_angle ([type]): [description]
-            radius ([type]): [description]
-            steps (int, optional): [description]. Defaults to 200.
-        """
-        def polar_point(origin_point, angle,  distance):
-            return [origin_point.x + math.sin(angle) * distance, origin_point.y + math.cos(angle) * distance]
-
-        if start_angle > end_angle:
-            start_angle = start_angle - 2*math.pi
-        else:
-            pass
-        step_angle_width = (end_angle-start_angle) / steps
-        sector_width = (end_angle-start_angle) 
-        segment_vertices = []
-
-        segment_vertices.append(polar_point(center, 0,0))
-        segment_vertices.append(polar_point(center, start_angle,radius))
-
-        for z in range(1, steps):
-            segment_vertices.append((polar_point(center, start_angle + z * step_angle_width,radius)))
-        segment_vertices.append(polar_point(center, start_angle+sector_width, radius))
-        segment_vertices.append(polar_point(center, 0,0))
-        return shapely.geometry.Polygon(segment_vertices)
-
-    def check_for_dynamic_obstacles_ahead(self, x):
-        center = shapely.geometry.Point(x[1], x[0])
-        ang_master = x[2] + 2*np.pi if x[2] < 0 else 0
-        ang_start = ang_master + self.solver_param.base.ang_detect_dyn_obs
-        ang_end = ang_master - self.solver_param.base.ang_detect_dyn_obs
-        circle_sector = self.create_circle_sector(center, ang_start, ang_end, self.solver_param.base.dist_detect_dyn_obs)
-
-        # TODO: Actually check for obstacles ahead 
-
-        return circle_sector
-
 
     def generate_control_input(self, parameters, guess=None):
         """Calls on the nmpc solver mng with parameters to find the next control inputs
@@ -398,7 +309,7 @@ class PanocNMPCTrajectoryProblem:
 
         return ref_cost, parameters, solution
 
-    def gen_line_following_traj(self, x_cur, dyn_constraints, closest_dynamic_obs_poly, line_vertices_master, line_vertices_slave, formation_angle_ref, constraints, active_dyn_obs, distance_lb, distance_ub, aggressive_factor, bounds_eqs, u_prev, initial_guess_master, prev_acc):
+    def gen_line_following_traj(self, x_cur, dyn_constraints, line_vertices_master, line_vertices_slave, formation_angle_ref, constraints, active_dyn_obs, distance_lb, distance_ub, aggressive_factor, bounds_eqs, u_prev, initial_guess_master, prev_acc):
         master_angle_ref = self.mpc_generator.calc_master_ref_angle(x_cur[:3], *line_vertices_master[:3])
 
         # Build parameter list
@@ -411,9 +322,6 @@ class PanocNMPCTrajectoryProblem:
         for i in range(0, self.solver_param.base.n_hor):
             refs += list(line_vertices_master[i]) + [0] 
             refs += list(line_vertices_slave[i]) + [0]
-
-        # Check if there are dynamic obstacles which might need to be avoided. If so reduce q_cte, q_theta, q_formation
-        search_sector = self.check_for_dynamic_obstacles_ahead(x_cur[:3])
         
         # Master only trajectory generation weights
         weight_list_soft = [self.solver_param.line_follow_weights.q_lin_v, 
@@ -473,7 +381,7 @@ class PanocNMPCTrajectoryProblem:
         solution, ref_cost = self.generate_control_input(parameters, guess=initial_guess_master)
                                 
         
-        return ref_cost, parameters, solution, search_sector
+        return ref_cost, parameters, solution
 
     def gen_traj_following_traj(self, trajectory_ref, u_ref, x_cur, formation_angle_ref, x_finish, constraints, dyn_constraints, active_dyn_obs, distance_lb, distance_ub, aggressive_factor, bounds_eqs, u_previous, initial_guess_dual, prev_acc):
         acc_init = prev_acc
@@ -572,7 +480,6 @@ class PanocNMPCTrajectoryProblem:
 
         return ref_cost, parameters, solution
 
-
     def calculate_dist_between_nodes(self, nodes, cumsum=True):
         assert(nodes.shape[1]==2), f"The nodes array sent to {self.print_name}.calculate_dist_between_nodes must be of shape: (-1, 2). They were in shape: {nodes.shape}."
         block_distance = np.diff(nodes, axis=0)
@@ -615,10 +522,7 @@ class PanocNMPCTrajectoryProblem:
 
         best_reference_point = list(best_reference_point) + [0]
             
-
-
-        # Find the line vertices
-        # Find the first vertix on the current line
+        # Find the line vertices; Find the first vertix on the current line
         cur_node = ref_points[0]
         node_to_check_idx = 1
         calc_ang_between_nodes = lambda p1, p2: np.arctan2(p2[1]-p1[1], p2[0]-p1[0])
@@ -639,7 +543,6 @@ class PanocNMPCTrajectoryProblem:
         # Add last vertix
         line_vertices.append(ref_points[-1])
 
-
         # Calculate closest lines
         lines = [[np.array(line_vertices[i], dtype=float), np.array(line_vertices[i+1], dtype=float)] for i in range(len(line_vertices)-1)]
         dist_to_lines = np.array([self.mpc_generator.dist_to_line(x_cur[:2], *line).__float__() for line in lines])**0.5
@@ -652,19 +555,12 @@ class PanocNMPCTrajectoryProblem:
             if dist_lines_ahead[i] < 0: 
                 line_vertices.append(lines[i+closest_line_idx][1]) 
 
-
         # Make sure the list of vertices is long enough
         line_vertices += [line_vertices[-1]]*(self.solver_param.base.n_hor - len(line_vertices))
 
         assert(len(line_vertices) == self.solver_param.base.n_hor), f"There are too many ref points. There can only be {self.solver_param.base.n_hor} and there were {len(line_vertices)}."
                 
-
         return best_reference_point, line_vertices, ref_point_within_reach
-
-    def generate_vel_ref(self, x_cur):
-        # TODO : implement this
-        vel_ref = 0
-        return vel_ref
 
     def offset_trajectory(self, base_trajectory, offset_angle):
         offset_traj = []
@@ -713,8 +609,5 @@ class PanocNMPCTrajectoryProblem:
 
         trajectory = np.concatenate((x_master, y_master, theta_master, x_slave, y_slave, theta_slave, v_master, ang_master, v_slave, ang_slave), axis=1)
 
-
         return trajectory
         
-
-   

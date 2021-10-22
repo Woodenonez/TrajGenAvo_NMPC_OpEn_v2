@@ -1,7 +1,10 @@
+import os, sys
+from time import perf_counter_ns
 from queue import Full
+
 import numpy as np
 import casadi as cs
-from time import perf_counter_ns
+
 from mpc.mpc_generator import MpcModule
 from utils.config import SolverParams
 

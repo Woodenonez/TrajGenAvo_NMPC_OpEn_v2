@@ -1,14 +1,12 @@
-import imp
-import json
-from extremitypathfinder.extremitypathfinder import PolygonEnvironment
-from networkx.algorithms import boundary
-import numpy as np
-import matplotlib.pyplot as plt
-from shapely import geometry
-from sympy.core.evalf import N
-from time import perf_counter_ns
-from pathlib import Path
 import os
+import json
+from pathlib import Path
+from time import perf_counter_ns
+
+import numpy as np
+
+from shapely import geometry
+from extremitypathfinder.extremitypathfinder import PolygonEnvironment
 
 class PathPlanner:
     """Class which does local path planning. Local path finding utilizes visibility graph to 
