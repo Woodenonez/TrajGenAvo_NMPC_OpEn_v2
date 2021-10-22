@@ -5,7 +5,7 @@ Master thesis at Chalmers University of Technology. We've implemented an algorit
 ## Dependencies
 
 ## Algorithm 
-The algorithm is explained in detail in the accompinying [paper](docs/Master\ thesis\ report.pdf).
+The algorithm is explained in detail in the accompinying [paper](docs/Master thesis report.pdf).
  
 
 ## Short explanation of code 
