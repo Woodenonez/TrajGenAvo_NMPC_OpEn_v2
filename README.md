@@ -1,11 +1,11 @@
 # Formation control of autonomous transport robots
 Master thesis at Chalmers University of Technology. We've implemented an algorithm that generates a smooth, collision free path and trajectory for one or two differential drive robots. 
 
-![Example](docs/CleanedCodeSim.png "Example")
+![Example](docs/Cover.png "Example")
 ## Dependencies
 
 ## Algorithm 
-The algorithm is explained in detail in the accompinying [paper](docs/Master_thesis_GPSS__Formation_control_of_autonomous_transport_robots.pdf).
+The algorithm is explained in detail in the accompinying [paper](docs/Master thesis report.pdf).
  
 
 ## Short explanation of code 
