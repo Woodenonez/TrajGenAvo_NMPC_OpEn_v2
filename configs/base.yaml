@@ -18,10 +18,9 @@ ang_jerk_max: 0.2
 
 # Parameters for constraints. This shouldn't really be here. It should maybe be in graphs
 constraint:         # Distance constraint
-    d: 1                     # The distance the atrs should keep in m
-    distance_error_lb: -0.05        # lower bound error margin in m, actual ok distance: d + distance_error_lb <d_ok < d + distance_error_ub
+    d: 1                        # The distance the atrs should keep in m
+    distance_error_lb: -0.05    # lower bound error margin in m, actual ok distance: d + distance_error_lb <d_ok < d + distance_error_ub
     distance_error_ub: 0.05     # upper bound error margin
-    distance_error_margin: 0.05
     distance_lb: 0.95           # Lower bound distance between ATRs
     distance_ub: 1.05           # Upper bound distance between ATRs
     formation_angle: 0
