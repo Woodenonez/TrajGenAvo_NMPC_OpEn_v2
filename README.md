@@ -1,11 +1,52 @@
 # Formation control of autonomous transport robots
 Master thesis at Chalmers University of Technology. We've implemented an algorithm that generates a smooth, collision free path and trajectory for one or two differential drive robots. 
 
-![Example](docs/CleanedCodeSim.png "Example")
+![Example](docs/Cover.png "Example")
 ## Dependencies
+### OpEn
+The NMPC formulation is solved using open source implementation of PANOC, namely [OpEn](https://alphaville.github.io/optimization-engine/). Follow the [installation instructions](https://alphaville.github.io/optimization-engine/docs/installation) before proceeding. 
+
+### CGAL depecencies
+You may not need to do it since all code is transfered already. But check this part if it doesn't work.
+
+To do triangulation [CGAL](https://www.cgal.org/) is used. Install this via:
+```
+sudo apt-get install -y libcgal-dev &&\
+sudo apt-get install -y swig &&\
+sudo apt-get install -y build-essential libssl-dev 
+```
+```
+cd Documents/ &&\
+sudo apt-get install -y wget &&\
+sudo wget https://github.com/Kitware/CMake/releases/download/v3.20.0/cmake-3.20.0.tar.gz &&\
+sudo tar -zxvf cmake-3.20.0.tar.gz &&\
+cd cmake-3.20.0 &&\
+sudo ./bootstrap &&\
+sudo make &&\
+sudo make install &&\
+sudo cmake --version 
+```
+
+To use CGAL with python the [python bindings](https://github.com/CGAL/cgal-swig-bindings) are used. Install these and move them to the correct location via the following commands. Note that these assume that this assumes that Formation-control-of-autonomous-transportation-robots is placed under ```Documents```.
+```
+cd Documents
+git clone https://github.com/cgal/cgal-swig-bindings &&\
+cd cgal-swig-bindings &&\
+mkdir build/CGAL-5.0_release -p &&\
+cd build/CGAL-5.0_release &&\
+sudo cmake -DCGAL_DIR=/usr/lib/CGAL -DBUILD_JAVA=OFF -DPYTHON_OUTDIR_PREFIX=../../examples/python ../.. &&\
+sudo make -j 4 &&\
+cd ../../examples/python &&\ 
+cp -r CGAL Documents/Formation-control-of-autonomous-transportation-robots/src/
+```
+
+### Others
+Check "import" or "error" :) 
+Sorry, I'm too lazy to do it here now.
+
 
 ## Algorithm 
-The algorithm is explained in detail in the accompinying [paper](docs/Master_thesis_GPSS__Formation_control_of_autonomous_transport_robots.pdf).
+The algorithm is explained in detail in the accompanying [paper](docs/Master%20thesis%20report.pdf).
  
 
 ## Short explanation of code 
