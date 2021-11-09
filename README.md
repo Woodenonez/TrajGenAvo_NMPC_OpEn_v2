@@ -7,7 +7,7 @@ Master thesis at Chalmers University of Technology. We've implemented an algorit
 The NMPC formulation is solved using open source implementation of PANOC, namely [OpEn](https://alphaville.github.io/optimization-engine/). Follow the [installation instructions](https://alphaville.github.io/optimization-engine/docs/installation) before proceeding. 
 
 ### CGAL depecencies
-You may not need to do it since all code is transfered already. But check this part if it doesn't work.
+You need to do this. The CGAL folder here is just for reference.
 
 To do triangulation [CGAL](https://www.cgal.org/) is used. Install this via:
 ```
