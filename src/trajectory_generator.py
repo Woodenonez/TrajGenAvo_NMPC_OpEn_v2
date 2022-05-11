@@ -1,5 +1,6 @@
 # Python imports
 import os, sys, yaml
+from sympy import root
 from time import perf_counter_ns
 from pathlib import Path
 from queue import Full
@@ -23,9 +24,9 @@ from utils.config import Configurator, SolverParams, Weights
 class TrajectoryGenerator:
     """Class that generates control inputs. Uses solver_paramuration file in solver_params folder
     """
-    def __init__(self, start_pose, verbose=False, name="[TrajGen]", self_destruct=True, master_goal = [], slave_goal = [], build_solver=False):
+    def __init__(self, start_pose, root_dir, verbose=False, name="[TrajGen]", self_destruct=True, master_goal = [], slave_goal = [], build_solver=False):
         # Get all the setups
-        solver_param, plot_queues, plot_process, plot_config = self.load_params()
+        solver_param, plot_queues, plot_process, plot_config = self.load_params(root_dir)
         # Check if we should rebuild solver
         if build_solver:
             MpcModule(solver_param).build()
@@ -49,9 +50,7 @@ class TrajectoryGenerator:
         self.solver_param = solver_param
 
         # Import the solver
-        sys.path.append(Path(__file__).parent.parent.__str__() + '/mpc_build/' + self.solver_param.base.optimizer_name+'/')
-        import trajectory_generator_solver
-        self.solver = trajectory_generator_solver.solver()
+        self.import_solver(root_dir)
 
         # Setup all the classes that are needed
         self.robot_state = start_pose[0] + start_pose[1] # (start_master, start_slave)
@@ -86,36 +85,39 @@ class TrajectoryGenerator:
         # Flag for genereating 2s horizon
         self.two_seconds = False
 
-    def load_params(self): 
-        file_path = Path(__file__)
+    def import_solver(self, root_dir):
+        sys.path.append(os.path.join(root_dir, '/mpc_build/', self.solver_param.base.optimizer_name))
+        import trajectory_generator_solver
+        self.solver = trajectory_generator_solver.solver()
 
+    def load_params(self, root_dir): 
         base_fn = 'base.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', base_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', base_fn)
         configurator = Configurator(yaml_fp)
         base = configurator.configurate()
 
         weights_fn = 'line_follow_weights.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', weights_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', weights_fn)
         configurator = Weights(yaml_fp)
         line_follow_weights = configurator.configurate()
 
         weights_fn = 'line_follow_weights_aggressive.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', weights_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', weights_fn)
         configurator = Weights(yaml_fp)
         line_follow_weights_aggressive = configurator.configurate()
 
         weights_fn = 'traj_follow_weights.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', weights_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', weights_fn)
         configurator = Weights(yaml_fp)
         traj_follow_weights = configurator.configurate()
 
         weights_fn = 'traj_follow_weights_aggressive.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', weights_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', weights_fn)
         configurator = Weights(yaml_fp)
         traj_follow_weights_aggressive = configurator.configurate()
 
         weights_fn = 'pos_goal_weights.yaml'
-        yaml_fp = os.path.join(str(file_path.parent.parent), 'configs', weights_fn)
+        yaml_fp = os.path.join(root_dir, 'configs', weights_fn)
         configurator = Weights(yaml_fp)
         pos_goal_weights = configurator.configurate()
 
@@ -123,7 +125,7 @@ class TrajectoryGenerator:
         
         # Load plot config file
         plot_config = 'plot_config.yaml'
-        plot_config_fp = os.path.join(str(file_path.parent.parent), 'configs', plot_config)
+        plot_config_fp = os.path.join(root_dir, 'configs', plot_config)
         with open(plot_config_fp) as f:
             plot_config  = yaml.load(f, Loader=yaml.FullLoader)
         plot_queues, plot_process = start_plotter(solver_param.base, plot_config, aut_test_config=None)

@@ -21,13 +21,11 @@ def get_length(iterable):
         int: length of iterable
     """
     try:
-        length = len(iterable)
-        return length
+        return len(iterable)
     except:
         pass
     try:
-        length = iterable.shape[0]
-        return length
+        return iterable.shape[0]
     except:
         raise ValueError(f"Couldn't calculate length of {iterable}")
 

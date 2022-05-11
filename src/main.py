@@ -8,11 +8,11 @@ from path_planner.global_path_planner import GlobalPathPlanner
 def init(build=False, self_destruct=False):
 
         # Get path to this file
-        file_path = Path(__file__)
+        root_dir = Path(__file__).resolve().parents[1]
 
         # For simulation. copy obstacles to obstacels_copy since obstacles_copy changs for the dynamic simulation
-        obs_original = os.path.join(str(file_path.parent.parent), 'data', 'obstacles.json')
-        obs_copy     = os.path.join(str(file_path.parent.parent), 'data', 'obstacles_copy.json')
+        obs_original = os.path.join(root_dir, 'data', 'obstacles.json')
+        obs_copy     = os.path.join(root_dir, 'data', 'obstacles_copy.json')
         with open(obs_original) as f: 
             obs_json = json.load(f)
         with open(obs_copy, mode='w') as f: 
@@ -25,13 +25,13 @@ def init(build=False, self_destruct=False):
         slave_goal = [(5, 1, 1.57), (5, 8, 1.57), (4, 9, 1.57)]
     
         # Gloabal path
-        map_fp = os.path.join(str(file_path.parent.parent), 'data', 'map.json')
+        map_fp = os.path.join(root_dir, 'data', 'map.json')
         gpp = GlobalPathPlanner(map_fp)
         global_path = gpp.search_astar(master_goal[0][:2], master_goal[1][:2])
 
         # Create the trajectory generator and set global path
         start_pose = [start_master, start_slave]
-        traj_gen = TrajectoryGenerator(start_pose, verbose=True, name="TrajGen", self_destruct=self_destruct, master_goal= master_goal, slave_goal=slave_goal, build_solver=build)
+        traj_gen = TrajectoryGenerator(start_pose, root_dir, verbose=True, name="TrajGen", self_destruct=self_destruct, master_goal= master_goal, slave_goal=slave_goal, build_solver=build)
         traj_gen.set_global_path(global_path)
         return traj_gen
 
@@ -46,5 +46,5 @@ def main(build=False, destroy_plots=True):
 
 if __name__ == '__main__':
     
-    main()
+    main(build=True)
     print("All done.\nGood bye")
