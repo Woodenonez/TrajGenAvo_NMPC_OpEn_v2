@@ -86,7 +86,7 @@ class TrajectoryGenerator:
         self.two_seconds = False
 
     def import_solver(self, root_dir):
-        sys.path.append(os.path.join(root_dir, '/mpc_build/', self.solver_param.base.optimizer_name))
+        sys.path.append(os.path.join(root_dir, 'mpc_build/', self.solver_param.base.optimizer_name))
         import trajectory_generator_solver
         self.solver = trajectory_generator_solver.solver()
 
