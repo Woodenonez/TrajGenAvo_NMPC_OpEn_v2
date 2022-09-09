@@ -1,7 +1,10 @@
 # Formation control of autonomous transport robots
 Master thesis at Chalmers University of Technology. We've implemented an algorithm that generates a smooth, collision free path and trajectory for one or two differential drive robots. 
-
 ![Example](docs/Cover.png "Example")
+
+## Other version
+[First edition with new demos](https://github.com/Woodenonez/TrajGenAvo_NMPC_OpEn)
+
 ## Dependencies
 ### OpEn
 The NMPC formulation is solved using open source implementation of PANOC, namely [OpEn](https://alphaville.github.io/optimization-engine/). Follow the [installation instructions](https://alphaville.github.io/optimization-engine/docs/installation) before proceeding. 
